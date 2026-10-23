@@ -1,0 +1,1641 @@
+---
+title: "Placental microRNA signatures of spontaneous preterm birth"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+## Covariate Cleaning
+
+#### Load libraries and data
+
+`p0047_candle.csv` with data dictionary `p0047_data_dictionary.xlsx` was received from ECHO PATHWAYS data team on November 6th 2020 for sPTB placental transcriptome paper (PMID: 35868418) 
+
+`p0109_data.csv` with data dictionary `p0109_data_dictionary.xlsx` was received from ECHO PATHWAYS data team on  September 27, 2023 for Placental Transcriptome and prenatal vitamin D analysis
+
+`batch_one_miRs_20240718.Rds` Received from Jim MacDonald on 07/18/2024. **This is only half the data**. We will use this to generate batch information for the microRNAs.
+
+`all_miRs_20240718.Rds` Received from Jim MacDonald on 07/18/2024. **This is the complete data**.
+
+`candle_20200226.Rdata` Received from Jim MacDonald on September 28, 2023 for the vitamin D analysis
+
+```{r}
+library(tidyverse)  ## tidy data framework, ggplot2, pipes
+library(assertthat) ## sanity checks
+library(here)       ## sets path nicely for markdown
+library(edgeR)      ## differential expression analysis; limma/voom dependencies
+library(table1)     ## label functions works nicely with arsenal
+library(arsenal)    ## nice table 1 functionality
+library(coin)       ## need to run trend test with tableby (income variable)
+library(kableExtra) ## print nice tables to HTML
+library(ggrepel)    ## for repelling labels in volcano plots
+library(ggtext)     ## for nicely formatted ggplot axis labels
+library(igraph)     ## network stats
+
+## covar from sPTB paper
+p0047_candle <- read_csv("/Volumes/paquette_a/mparenti/sPTB_PlacentalTranscriptome_CANDLE/RawData/p0047_candle.csv")
+
+## covar from vitamin D paper
+p0109_data <- read_csv("/Volumes/paquette_a/mparenti/sPTB_PlacentalTranscriptome_CANDLE/RawData/p0109_data.csv")
+
+## mRNA data
+load("/Volumes/paquette_a/mparenti/sPTB_PlacentalTranscriptome_CANDLE/RawData/candle_20200226.Rdata")
+## loads annot, batches, candle_counts, candle_lengthScaledTPM and function fixCounts
+
+## miRNA data
+all_mirs <- readRDS("/Volumes/paquette_a/CANDLE_miRNA/RawData/all_mirs_20240718.Rds")
+
+batch_one_mirs <- readRDS("/Volumes/paquette_a/CANDLE_miRNA/RawData/batch_one_mirs_20240718.Rds")
+```
+
+#### Filter by inclusion criteria
+
+```{r}
+## sanity check (make sure all 765 miRNA samples and all 794 mRNA samples match)
+p0047_candle$pathways_id %in% colnames(as.data.frame(all_mirs)) |> sum()
+p0047_candle$pathways_id %in% colnames(candle_counts$counts) |> sum()
+
+## list IDs
+ids_mRNA <- colnames(candle_counts$counts) |> unique()
+ids_miRNA <- colnames(all_mirs)[-1] |> unique()
+
+## confirm the size of the intersect, 765
+ids_miRNA %in% ids_mRNA |> sum()
+
+## keep ids
+pathways_ids_to_keep <- ids_miRNA[ids_miRNA %in% ids_mRNA]
+
+## generate a miRNA sequencing variable
+miRNA_batches <- tibble::tibble(pathways_id = ids_miRNA) |>
+  dplyr::mutate(mir_batch = dplyr::if_else(pathways_id %in% colnames(batch_one_mirs) == TRUE, 1, 2))
+```
+
+#### Filter by exclusion criteria
+
+First, we will generate a simplified urinary cotinine variable.
+
+```{r}
+with(p0109_data, cor.test(cotinine_yn_m1, cotinine_yn_m2, method = "kendall"))
+
+p0109_data$cotinine_ever_yes <- dplyr::case_when(
+  p0109_data$cotinine_yn_m1 == 1 | p0109_data$cotinine_yn_m2 == 1 ~ 1, 
+  p0109_data$cotinine_yn_m1 == 0 | p0109_data$cotinine_yn_m2 == 0 ~ 0,
+  is.na(p0109_data$cotinine_yn_m1) == TRUE & is.na(p0109_data$cotinine_yn_m2) ~ NA
+  )
+
+summary(p0109_data$cotinine_ever_yes)
+```
+
+Now, generate the covariates. 
+
+```{r}
+covar <- p0047_candle |>
+  ## filter to correct IDs
+  dplyr::filter(pathways_id %in% pathways_ids_to_keep) |>
+  ## from 1503 to 765
+  ## remove participants with placental abruption, preeclampsia, or chorioamnionitis or NA values
+  dplyr::filter(m_chorio == "0" & h_placental_abrupt == "0" & m_preeclam == "0") |>
+  ## from 765 to 753
+  ## also other hypertension variables
+  
+  dplyr::filter(m1mb_chtn == "0") |> ## Chronic HTN in current pregnancy at M1 (NA = 5)
+  dplyr::filter(m1mb_chtn2 == "0") |> ## Chronic HTN ever (NA = 5)
+  dplyr::filter(ld_gesthtn4 == "0") |> ## PE or gHTN diagnosed since last visit at delivery (NA = 56)
+  dplyr::filter(ld_cshtn == "0" | is.na(ld_cshtn) == TRUE) |> ## C-section indication: PE/HTN
+  dplyr::filter(ld_mhtn == "0" | is.na(ld_mhtn) == TRUE) |> ## Delivery classifcation: PTB--PE/HTN
+  ## From 753 to 691
+  dplyr::filter(factor(labor_type) != "3") |> ## remove induced labors
+  ## from 691 to 476
+  ## regen bmi because weirdly lots of NAs despite the complete underlying variables
+  dplyr::mutate(prepreg_bmi = prepreg_weight_kg /((m_height_cm/100)^2)) |>
+  ## add in the miRNA batch; use left join to only match filtered data
+  dplyr::left_join(miRNA_batches, by = join_by(pathways_id)) |>
+  ## add in the miRNA batch; use left join to only match filtered data
+  dplyr::left_join(p0109_data |> 
+                     dplyr::select(pathways_id, zavg5_us_doc_dob_wght, cotinine_ever_yes) |> 
+                     na.omit()) |>
+   dplyr::mutate(smoking_composite = dplyr::case_when(
+    ## if self-report, yes
+    m_enroll_smoke == 1 ~ 1, 
+    ## if self-report no or no report but cotinine == yes, yes
+    (m_enroll_smoke == 0 | is.na(m_enroll_smoke) == TRUE) & cotinine_ever_yes == 1 ~ 1, 
+    ## if self-report no and cotinine == no or cotinine is NA, no
+    m_enroll_smoke == 0 & (is.na(cotinine_ever_yes) == TRUE | cotinine_ever_yes == 0) ~ 0, 
+    ## else, everything must be NA, so NA
+    is.na(m_enroll_smoke) == TRUE & (is.na(cotinine_ever_yes) == TRUE | cotinine_ever_yes == 0) ~ 8888
+    ) |> na_if(8888)) |>
+  dplyr::filter(is.na(smoking_composite) == FALSE) |>
+  dplyr::filter(is.na(m_enroll_income) == FALSE) |>
+  dplyr::filter(is.na(prepreg_bmi) == FALSE) |>
+  dplyr::filter(is.na(m_age_birth) == FALSE)
+
+## this is the grouping variable for supplementary table 1
+p0047_candle$included <- dplyr::if_else(p0047_candle$pathways_id %in% covar$pathways_id, 1, 0)
+```
+
+First, let's make a table to compare covariates. 
+
+For the supplementary table, let's test for differences between the  spontaneous births and the other CANDLE participants. 
+
+```{r, results='asis'}
+tabSup1data <- p0047_candle |>
+  dplyr::left_join(miRNA_batches, by = join_by(pathways_id)) |>
+  ## add in the miRNA batch; use left join to only match filtered data
+  dplyr::left_join(p0109_data |> 
+                     dplyr::select(pathways_id, zavg5_us_doc_dob_wght, cotinine_ever_yes) |> 
+                     na.omit()) |>
+   dplyr::mutate(smoking_composite = dplyr::case_when(
+    ## if self-report, yes
+    m_enroll_smoke == 1 ~ 1, 
+    ## if self-report no or no report but cotinine == yes, yes
+    (m_enroll_smoke == 0 | is.na(m_enroll_smoke) == TRUE) & cotinine_ever_yes == 1 ~ 1, 
+    ## if self-report no and cotinine == no or cotinine is NA, no
+    m_enroll_smoke == 0 & (is.na(cotinine_ever_yes) == TRUE | cotinine_ever_yes == 0) ~ 0, 
+    ## else, everything must be NA, so NA
+    is.na(m_enroll_smoke) == TRUE & (is.na(cotinine_ever_yes) == TRUE | cotinine_ever_yes == 0) ~ 8888
+    ) |> na_if(8888)) |>
+  within({
+    m_enroll_educ <- factor(m_enroll_educ, labels =  c("<HS", "HS graduate/GED", "Technical school", "College degree", "Grad/Professional degree"))
+    m_race <- factor(m_race, labels = c("Black/African American", "White", "Asian",
+                                        "American Indian/Alaska Native", 
+                                        "Native Hawaiian/Other Pacific Islander",
+                                        "Other", "Multiple race"))
+    c_sex <- factor(c_sex, labels = c("Male", "Female"))
+    labor_type <- factor(labor_type, labels = c("Spontaneous", "Spontaneous, augmented", "Induced", "No labor"))
+    del_method <- factor(del_method, labels = c("Vaginal", "C-section"))
+    m_enroll_smoke <- factor(m_enroll_smoke, labels = c("No", "Yes"))
+    m_enroll_alc <- factor(m_enroll_alc, labels = c("No", "Yes"))
+    m_enroll_income <- ordered(m_enroll_income, labels = c("$0-4999", "$5000-9999", "$10000-14999",
+                                                          "$15000-19999", "$20000-24999",
+                                                          "$25000-34999", "$35000-44999",
+                                                          "$45000-54999", "$55000-64999",
+                                                          "$65000-74999", "$75000 or over"))
+    preter_prior_yn <- factor(preterm_prior_yn, labels = c("No prior PTB", "At least 1 prior PTB"))
+    # mir_batch <- factor(mir_batch)
+    
+    ## regen bmi because weirdly lots of NAs despite the complete underlying variables
+    prepreg_bmi <- prepreg_weight_kg /((m_height_cm/100)^2) 
+    
+    ## preterm or not
+    ptb <- factor(ptrm_currpreg, labels = c("Term", "Preterm"))
+    smoking_composite <- factor(smoking_composite, labels = c("No", "Yes"))
+  })
+
+labels(tabSup1data) <- c(
+ m_age_birth = "Maternal age at birth",
+ prepreg_bmi = "Maternal pre-pregnancy BMI",
+ m_enroll_educ = "Maternal education",
+ m_enroll_income = "Income",
+ m_race = "Maternal race",
+ m_enroll_smoke = "Maternal smoking status",
+ m_enroll_alc = "Maternal alcohol use",
+ c_sex = "Fetal sex",
+ labor_type = "Labor type",
+ del_method = "Delivery method",
+ livebirths = "Total live births",
+ mir_batch = "miRNA-seq batch"
+ )
+
+tabSup1 <- tableby(included ~ m_age_birth +
+                       prepreg_bmi +
+                       m_enroll_educ +
+                       m_enroll_income +
+                       m_race +
+                  smoking_composite + 
+                  m_enroll_alc +
+                       c_sex +
+                       labor_type +
+                       del_method +
+                    ptb,
+                 data = tabSup1data, 
+                 numeric.test = "anova", cat.test = "chisq",
+                 numeric.stats = c("meansd", "medianq1q3", "Nmiss"),
+                 cat.stats = c("countpct", "Nmiss"),
+                 stats.labels = list(Nmiss = "Missing"))
+
+summary(tabSup1) 
+```
+
+Let's also try a T test for the two continuous variables. 
+
+```{r}
+rstatix::levene_test(m_age_birth ~ factor(included), data = tabSup1data, center = "mean")
+
+t.test(m_age_birth ~ included, 
+       data = tabSup1data,
+       alternative = "two.sided", var.equal = TRUE)
+
+rstatix::levene_test(prepreg_bmi ~ factor(included), data = tabSup1data, center = "mean")
+
+t.test(prepreg_bmi ~ included, 
+       data = tabSup1data,
+       alternative = "two.sided", var.equal = TRUE)
+```
+
+Let's also look at the samples included in the network. Recall that this table is the the cleaning sequencing data file for network generation. We can pull these together to make the final supplementary table.
+
+Now, let's build table 1: comparing TERM and PRETERM among the spontaneous births.
+
+```{r, results='asis'}
+tab1data <- within(covar, {
+  m_enroll_educ <- factor(m_enroll_educ, labels =  c("<HS", "HS graduate/GED", "Technical school", "College degree", "Grad/Professional degree"))
+  m_race <- factor(m_race, labels = c("Black/African American", "White", "Asian", "Other", "Multiple race"))
+  c_sex <- factor(c_sex, labels = c("Male", "Female"))
+  labor_type <- factor(labor_type, labels = c("Spontaneous", "Spontaneous, augmented", "No labor"))
+  del_method <- factor(del_method, labels = c("Vaginal", "C-section"))
+  m_enroll_alc <- factor(m_enroll_alc, labels = c("No", "Yes"))
+  m_enroll_income <- ordered(m_enroll_income, labels = c("$0-4999", "$5000-9999", "$10000-14999",
+                                                        "$15000-19999", "$20000-24999",
+                                                        "$25000-34999", "$35000-44999",
+                                                        "$45000-54999", "$55000-64999",
+                                                        "$65000-74999", "$75000 or over"))
+  mir_batch <- factor(mir_batch)
+  
+  ## regen bmi because weirdly lots of NAs despite the complete underlying variables
+  prepreg_bmi <- prepreg_weight_kg /((m_height_cm/100)^2) 
+  
+  ## preterm or not
+  ptb <- factor(ptrm_currpreg, labels = c("Term", "Preterm"))
+  smoking_composite <- factor(smoking_composite, labels = c("No", "Yes"))
+  })
+
+labels(tab1data) <- c(
+ m_age_birth = "Maternal age at birth",
+ prepreg_bmi = "Maternal pre-pregnancy BMI",
+ m_enroll_educ = "Maternal education",
+ m_enroll_income = "Income",
+ m_race = "Maternal race",
+ m_enroll_smoke = "Maternal smoking status",
+ m_enroll_alc = "Maternal alcohol use",
+ c_sex = "Fetal sex",
+ labor_type = "Labor type",
+ del_method = "Delivery method",
+ livebirths = "Total live births",
+ mir_batch = "miRNA-seq batch"
+ )
+
+tab1 <- tableby(ptb ~ m_age_birth +
+                       prepreg_bmi +
+                       m_enroll_educ +
+                       m_enroll_income +
+                       m_race +
+                  smoking_composite + 
+                  m_enroll_alc +
+                       c_sex +
+                       labor_type +
+                       del_method,
+                 data = tab1data, 
+                 numeric.test = "anova", cat.test = "chisq",
+                 numeric.stats = c("meansd", "medianq1q3", "Nmiss"),
+                 cat.stats = c("countpct", "Nmiss"),
+                 stats.labels = list(Nmiss = "Missing"))
+
+summary(tab1)
+```
+
+Let's also try a T test for the two continuous variables. 
+
+```{r}
+var.test(m_age_birth ~ ptb, data = tab1data)
+
+t.test(m_age_birth ~ ptb, 
+       data = tab1data,
+       alternative = "two.sided", var.equal = TRUE)
+
+var.test(prepreg_bmi ~ ptb, data = tab1data)
+
+t.test(prepreg_bmi ~ ptb, 
+       data = tab1data,
+       alternative = "two.sided", var.equal = TRUE)
+```
+
+Convert the structure to the actual `covar` dataset. 
+
+```{r}
+## factor COVAR
+covar <- within(covar, {
+  mir_batch <- factor(mir_batch)
+  m_enroll_educ <- factor(m_enroll_educ, labels =  c("<HS", "HS graduate/GED", "Technical school", "College degree", "Grad/Professional degree"))
+  m_race <- factor(m_race, labels = c("Black/African American", "White", "Asian", "Other", "Multiple race"))
+  c_sex <- factor(c_sex, labels = c("Male", "Female"))
+  labor_type <- factor(labor_type, labels = c("Spontaneous", "Spontaneous, augmented", "No labor"))
+  del_method <- factor(del_method, labels = c("Vaginal", "C-section"))
+  m_enroll_smoke <- factor(m_enroll_smoke, labels = c("No", "Yes"))
+  smoking_composite <- factor(smoking_composite, labels = c("No", "Yes"))
+  m_enroll_alc <- factor(m_enroll_alc, labels = c("No", "Yes"))
+  m_enroll_income <- ordered(m_enroll_income, labels = c("$0-4999", "$5000-9999", "$10000-14999",
+                                                        "$15000-19999", "$20000-24999",
+                                                        "$25000-34999", "$35000-44999",
+                                                        "$45000-54999", "$55000-64999",
+                                                        "$65000-74999", "$75000 or over"))
+  ## regen bmi because weirdly lots of NAs despite the complete underlying variables
+  prepreg_bmi <- prepreg_weight_kg /((m_height_cm/100)^2) 
+  
+  ## preterm or not
+  ptb <- factor(ptrm_currpreg, labels = c("Term", "Preterm"))
+  
+  })
+```
+
+Remove extra information from the environment, like the mRNA data that we only needed to determine inclusion criteria and the batch_one_mirs
+
+```{r}
+rm(annot, batches, candle_counts, candle_lengthScaledTPM, fixCounts, batch_one_mirs)
+```
+
+## MicroRNA Cleaning
+
+Here, I am adapting code from Alison's CRH analysis in CANDLE (CRH_PreliminaryDataPreprocessing_3102023.Rmd) and her miRNA cleaning.
+
+```{r}
+Counts <- all_mirs[, covar$pathways_id]
+
+## make an annotation file
+rownames(Counts) <- all_mirs$Name
+
+annot <- tibble(name = all_mirs$Name, 
+                miRNA = dplyr::if_else(str_detect(all_mirs$Name, "miR"), 1, 0),
+                piRNA = dplyr::if_else(str_detect(all_mirs$Name, "piR"), 1, 0)) |>
+  ## the let miRNAs aren't labled, so let's fix that
+  dplyr::mutate(miRNA = dplyr::if_else(str_detect(all_mirs$Name, "let"), 1, miRNA))
+
+# rownames(annot) <- annot$name
+
+## sanity check 
+table(annot$miRNA, annot$piRNA)
+
+print("Original")
+print(dim(Counts)[1])
+print(dim(annot)[1])
+
+## there are some NAs that need to be turned to 1s since cpm cannot handle them
+Counts[is.na(Counts)] <- 0
+
+## UPDATE 20240807
+## remove piRNAs
+annot <- annot[annot$piRNA != 1, ]
+Counts <- Counts[annot$name, ]
+
+## Get CPM & Log Transform
+cpm <- cpm(Counts, log = TRUE)
+
+## filter based on low expression
+keep <- rowMeans(cpm) > 0
+summary(keep)
+
+cpm_filt <- cpm[keep, ]
+annot <- annot[keep, ]
+counts_filt <- Counts[keep, ]
+
+print("Filtering")
+print(dim(cpm_filt)[1])
+print(dim(annot)[1])
+print(dim(counts_filt)[1])
+
+plot(density(cpm), main="Before Filtering")
+abline(v = 0, col = "red", lty = 2)
+plot(density(cpm_filt), main="After Filtering")
+abline(v = 0, col = "red", lty = 2)
+
+Y <- DGEList(counts = counts_filt)
+
+boxplot(Y$counts[, 1:10])
+boxplot(cpm[, 1:10])
+boxplot(cpm(Y, log = T)[, 1:10])
+Y <- calcNormFactors(Y, method = "TMM") # This is the Default Method
+boxplot(cpm(Y, log = T)[, 1:10])
+
+### Calculate CPM
+CPM <- cpm(Y, log = T)
+
+rownames(CPM) <- rownames(counts_filt)
+
+sncRNA <- Y
+```
+
+## Differential Expression Analysis
+
+### Preterm birth in overall analysis
+
+First, generate the primary model.
+
+```{r}
+mod <- with(covar, 
+            model.matrix(~ ptb +
+                           ## confounders
+                           m_race + 
+                           m_enroll_income +
+                           prepreg_bmi +
+                           m_enroll_educ +
+                           m_age_birth +
+                           smoking_composite +
+                           m_enroll_alc +
+                           labor_type +
+                           ## precision variables
+                           mir_batch +
+                           c_sex
+                          ))
+```
+
+Now, conduct limma-voom.
+
+```{r}
+v <- voom(sncRNA, mod, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+fit <- topTable(fit, coef = 2, number=dim(fit)[1], adjust.method = "BH") #Coefficent 2 is PTB
+
+hist(fit$P.Value, breaks = 20, main = "Spontaneous Preterm Birth")
+abline(h = 557/20)
+
+Results <- fit
+
+table(Results$adj.P.Val < 0.05)
+```
+
+### Gestational age (in WEEKS) overall analysis
+
+First, generate the secondary model.
+
+```{r}
+mod_ga_wk <- with(covar |>
+                    dplyr::mutate(
+                      ga = birth_gestage/7
+                    ), 
+            model.matrix(~ ga +
+                           ## confounders
+                           m_race + 
+                           m_enroll_income +
+                           prepreg_bmi +
+                           m_enroll_educ +
+                           m_age_birth +
+                           smoking_composite +
+                           m_enroll_alc +
+                           labor_type +
+                           ## precision variables
+                           mir_batch + 
+                           c_sex
+                          ))
+```
+
+Now, conduct limma-voom. Note that above we are comparing PTB to term birth (control/reference), but here, gestational age is a continuous variable. So we would expect these results to be **opposite** in direction.
+
+```{r}
+v <- voom(sncRNA, mod_ga_wk, plot=TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+fit <- topTable(fit, coef = 2, number=dim(fit)[1], adjust.method = "BH") ## Coefficent 2 is GA at birth
+
+hist(fit$P.Value, breaks = 20, main = "Gestational Length (Weeks)")
+abline(h = 557/20)
+
+Results_GA_WK <-fit
+Results_GA_WK$pct_change <- 100*(2^Results_GA_WK$logFC-1)
+
+table(Results_GA_WK$adj.P.Val < 0.05)
+```
+
+### MiRNA precursors and families
+
+How many miRNA precursors are represented here?
+
+```{r}
+coordinates <- ape::read.gff(here::here("network_construction", "mirbase", "hsa.gff3")) |>
+  ## want to get attributes out, so make attributes a list
+  dplyr::mutate(attributes_as_list = base::strsplit(attributes, ";")) |>
+  ## pull the attributes out into individual rows
+  tidyr::unnest_longer(attributes_as_list) |>
+  ## separate the attribute name from the value
+  tidyr::separate_wider_delim(cols = attributes_as_list, delim = "=",
+                       names = c("attribute", "value")) |>
+  ## pivot wider so there is one row per observation
+  tidyr::pivot_wider(id_cols = 1:9, names_from = attribute, values_from = value) |>
+  ## remove null columns
+  dplyr::select(-c(source, score, phase, attributes)) |>
+  dplyr::filter(Name %in% rownames(Results)[Results$adj.P.Val<0.05])
+
+coordinates |>
+  dplyr::pull(Derives_from) |>
+  unique() |>
+  length()
+
+miR_family <- read_tsv(here::here("network_construction", "TargetScan", "miR_Family_Info.txt")) |> 
+  dplyr::filter(`Species ID` == 9606) |>
+  dplyr::filter(`MiRBase ID` %in% rownames(Results)[Results$adj.P.Val<0.05])
+
+miR_family |>
+  # dplyr::pull(`miR family`) |>
+  dplyr::pull(`Seed+m8`) |>
+  unique() |>
+  length()
+```
+
+## Interpretation
+
+Read in the list of targets. This is our edge list for the full miRNA--mRNA network. 
+
+```{r}
+## read data
+## mRNA targets of miRNA:
+## first, we found all predicted using TargetScan
+## then, pruned based on negative spearman correlations
+targets <- read_csv(here::here("network_construction", "allPairs_edges_20240719.csv"))
+
+## read gene annotation file
+annotation <- read_csv(here::here("network_construction", "intermediateData", "annotation_gencode_v33_proteincoding.csv")) |>
+    dplyr::mutate(ensembl_gene_id = gsub("\\..*", "", ensembl_gene_id_version))
+
+## placenta specific miRNAs
+miRNA_clusters <- read_csv(here::here("network_construction", "intermediateData", "placenta_specific_miRNA_clusters_updated.csv"))
+```
+
+We also need our list of significant mRNA and miRNA related to sPTB. 
+For now, let's focus on just the preterm birth vs term birth comparisons. 
+
+```{r}
+## DEGs from sPTB paper
+apaquette2023_sPTB_DEG <- readxl::read_excel("/Volumes/paquette_a/mparenti/nutrientCofactors/apaquette2023_sPTB_DEG.xlsx",
+                                             skip = 1)
+
+colnames(apaquette2023_sPTB_DEG) <- c("gene_name", "logFC_ptb", "FDR_ptb", "logFC_eptb", "FDR_eptb", "logFC_lptb", "FDR_lptb", "priorLit_pereyra2019", "priorLit_brockway2019", "priorLit_paquette2018")
+
+## primarily, interested in the DEGs for preterm vs term births
+ptb_mRNAs <- apaquette2023_sPTB_DEG |> dplyr::filter(is.na(logFC_ptb) == FALSE) |> 
+  dplyr::select(gene_name, logFC = logFC_ptb, FDR = FDR_ptb) |>
+  dplyr::inner_join(annotation |> 
+                      dplyr::select(gene_name, hgnc_id, ensembl_gene_id) |>
+                      dplyr::distinct()) 
+
+ptb_sncRNAs <- Results |>
+  dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "Name")) |>
+  dplyr::select(gene_symbol = Name, logFC, FDR = adj.P.Val) |>
+  dplyr::filter(FDR < 0.05) 
+
+ga_sncRNAs <- Results_GA_WK |>
+  dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "Name")) |>
+  dplyr::select(gene_symbol = Name, logFC, FDR = adj.P.Val) |>
+  dplyr::filter(FDR < 0.05) 
+
+rm(apaquette2023_sPTB_DEG)
+```
+
+Generate the volcano plot
+
+```{r, fig.width=6.5, fig.height=4}
+differential_colors <- scico::scico(11, palette = "bam")
+
+Results |>
+  dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "Name")) |>
+  ## make variables for plotting
+  dplyr::mutate(isSig = dplyr::if_else(adj.P.Val < 0.05, 1, 0),
+                direction = dplyr::case_when(adj.P.Val < 0.05 & logFC < 0 ~ "down",
+                                             adj.P.Val < 0.05 & logFC > 0 ~ "up",
+                                             adj.P.Val >= 0.05 ~ "none" ) |>
+                  factor(levels = c("down", "none", "up")),
+                point_name = dplyr::if_else(adj.P.Val < 0.05, Name, "NA")
+                )|>
+  dplyr::left_join(miRNA_clusters) |>
+  ## volcano plot
+  ggplot(aes(x = logFC, y = -log10(P.Value))) +
+  ## lines for pvalues
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey80") +
+  geom_hline(yintercept = -log10(0.05/557), linetype = "dashed", color = "grey80") +
+  ## labels 
+  labs(y = "-log~10~(*P*)") +
+  ## points
+  ## first, highlight the C14MC points and let-7 family
+  geom_point(data = ~dplyr::filter(.x, cluster == "C14MC" & isSig == 1), 
+             shape = 16, 
+             # color = "turquoise3",
+             color = "turquoise3",
+             size = 2) +
+  geom_point(data = ~dplyr::filter(.x, stringr::str_detect(point_name, "let-7") == TRUE), 
+             shape = 16, 
+             # color = "turquoise3",
+             color = "brown2",
+             size = 2) +
+  ## all other points
+  geom_point(shape = 21, 
+             color = "#FFFFFF00", 
+             size = 1,
+             aes(fill = direction)) +
+  geom_text_repel(data = ~ dplyr::filter(.x, isSig == 1), 
+                  size = 3, 
+                  na.rm = TRUE,
+                  seed = 2024,
+                  segment.alpha = 0.4,
+                  max.overlaps = 20,
+                  aes(color = direction, 
+                      label = point_name), 
+                  box.padding = 0.5,
+                  min.segment.length = 0) +
+  ## scales
+  scale_color_manual(values = c(differential_colors[1],  differential_colors[11])) +
+  scale_fill_manual(values = c(differential_colors[3], "grey", differential_colors[9])) +
+  scale_shape_manual(values = c(21, 23, 24, 25)) +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "none",
+        axis.title.y = ggtext::element_markdown())
+
+ggsave(filename = here::here("sptb_analysis", "output", "volcano_plot.pdf"), 
+       width = 6.5, height = 4, units = "in")
+```
+
+We also want the plots of the significant miRNA by outcome. 
+
+```{r fig.width=6.5, fig.height=9}
+miR_list <- ptb_sncRNAs |>
+  dplyr::arrange(gene_symbol) |>
+  dplyr::pull(gene_symbol)
+
+## Make CPM into a matrix to transpose and then have samples in rows to join to covar
+cpm_df <- CPM |>
+    t() |>
+    as.data.frame() |>
+    tibble::rownames_to_column(var = "pathways_id") |>
+    dplyr::full_join(covar |> dplyr::select(pathways_id, birth_gestage, ptb, c_sex),
+                     by = join_by(pathways_id))
+
+temp <- cpm_df |>
+  dplyr::select(all_of(c("ptb", miR_list))) |>
+  tidyr::pivot_longer(cols = 2:20, names_to = "sncRNA", values_to = "expression")
+  
+plt <- ggplot(temp, aes(x = ptb, y = expression)) +
+    ## data
+    geom_jitter(width = 0.2, height = 0, ## do not jitter height!
+                aes(color = ptb), 
+                size = 1,
+                alpha = 0.8) + 
+  geom_boxplot(outliers = FALSE, 
+               alpha = 0) +
+    ## scales
+    scale_color_manual(values = c("gray50", "sienna1")) + 
+    ## axes and labels
+    xlab("") +
+    ylab("logCPM Expression") +
+    ggtitle("") +
+    theme_bw() +
+    theme(legend.position = "none",
+          axis.line.x = element_line(color="black", linewidth = .5),
+          axis.line.y = element_line(color="black", linewidth = .5),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) +
+    facet_wrap(. ~ sncRNA, nrow = 5, ncol = 4, scales = "free")
+  
+plt
+
+ggsave(filename = here::here("sptb_analysis", "output", "sptb_DEmiR_expression.pdf"),
+       width = 6.5, height = 9, units = "in")
+```
+
+We also want the distribution plot for the predicted pairs correlations (this is all weights, not just the targets/edgelist).
+
+```{r fig.width=6.5, fig.height=4}
+weights_allPredictedPairs <- read_csv("network_construction", "weights_allPredictedPairs.csv")
+
+weights_allPredictedPairs |>
+  dplyr::mutate(FDR = p.adjust(p.value, method = "BH")) |>
+  dplyr::mutate(retained = dplyr::if_else(estimate < 0 & FDR < 0.05, "keep", "drop") |> factor()) |>
+  ## plot
+  ggplot() +
+  ## label axes
+  xlab("Edge weights\n(Spearman's rho)") +
+  ylab("Number of predicted pairs") +
+  geom_histogram(aes(x = estimate, 
+                     fill = retained),
+                 bins = 200,
+                 color = NA) +
+  ## scales
+  scale_fill_manual(values = c("lightsteelblue", "steelblue4"),
+                    name = "Retained in\nmiRNA network",
+                    labels = c("No", "Yes")) +
+  ## cutoff line
+  geom_vline(xintercept = 0, color = "grey40", linetype = "dashed") +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "right")
+
+ggsave(filename = here::here("sptb_analysis", "output", "edge_distribution.pdf"), 
+       width = 6.5, height = 4, units = "in")
+
+rm(weights_allPredictedPairs)
+```
+
+### Build Table 2
+
+Make a table describing the number of mRNA in each regulon and how many are sPTB-associated. 
+
+```{r}
+sptb_mir <- ptb_sncRNAs |>
+  dplyr::pull(gene_symbol) |>
+  unique() |>  
+  sort()
+
+ga_mir <- ga_sncRNAs |>
+  dplyr::pull(gene_symbol) |>
+  unique() |>  
+  sort()
+
+## results for both GA and sPTB
+sptb_mir[sptb_mir %in% ga_mir]
+
+## miRNA only associated with sPTB
+sptb_mir[!sptb_mir %in% ga_mir]
+
+## miRNA only associated with GA at birth
+ga_mir[!ga_mir %in% sptb_mir]
+```
+
+Check the total number of genes these sPTB-associated miRNA target. 
+
+```{r}
+targets |>
+  dplyr::filter(miRNA %in% sptb_mir) |>
+  dplyr::pull(mRNA_target) |>
+  unique() |>
+  length()
+```
+
+Merge all of the data together.
+
+```{r}
+all_mir_of_interest <- c(ga_sncRNAs |> dplyr::pull(gene_symbol), 
+                         ptb_sncRNAs |> dplyr::pull(gene_symbol)) |>
+  unique()
+
+## summarize
+regulon_counts <- targets |>
+  dplyr::group_by(miRNA) |>
+  dplyr::select(miRNA) |>
+  count() |>
+  dplyr::rename(target_counts = n)
+
+regulon_counts_sptb <- targets |>
+  dplyr::filter(mRNA_target %in% ptb_mRNAs$ensembl_gene_id) |>
+  dplyr::group_by(miRNA) |>
+  dplyr::select(miRNA) |>
+  count() |>
+  dplyr::rename(sptb_target_counts = n)
+
+regulon_table <- dplyr::full_join(regulon_counts, regulon_counts_sptb) 
+
+results_table2 <- dplyr::bind_rows(
+  Results |>
+    dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "Name")) |>
+    dplyr::select(gene_symbol = Name, logFC, FDR = adj.P.Val) |>
+    dplyr::mutate(exposure = "sPTB"),
+  
+  Results_GA_WK |>
+    dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "Name")) |>
+    dplyr::select(gene_symbol = Name, logFC, FDR = adj.P.Val) |> 
+    dplyr::mutate(exposure = "GA")
+  ) |>
+  dplyr::select(miRNA = gene_symbol, exposure, logFC, FDR) |>
+  dplyr::distinct() |>
+  tidyr::pivot_wider(id_cols = miRNA, 
+                     names_from = exposure, 
+                     values_from = logFC:FDR, 
+                     names_vary = "slowest") |>
+  dplyr::left_join(regulon_table) |>
+  dplyr::filter(miRNA %in% all_mir_of_interest) |>
+  dplyr::mutate(miRNA = factor(miRNA, levels = c(sptb_mir[!sptb_mir %in% ga_mir], 
+                                                 sptb_mir[sptb_mir %in% ga_mir], 
+                                                 ga_mir[!ga_mir %in% sptb_mir]))) |>
+  dplyr::arrange(miRNA) 
+
+write_csv(results_table2, file = here::here("sptb_analysis", "output", "results_table2_DEmiR_regulons_20260821.csv"))
+
+results_table2 |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+Test if any regulons are enriched for sPTB-associated DEGs. 
+
+```{r}
+miRNA_sptb_enrichment_table <- read_csv(here::here("network_generation", "interpretation_20250407", "miRNA_sPTB_enrichement.csv"))
+
+miRNA_sptb_enrichment_table |>
+  dplyr::filter(miRNA %in% all_mir_of_interest) |>
+  dplyr::filter(p < 0.05) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+## Interpretation: Pathway ORA
+
+```{r}
+enriched_pathways <- read_csv(here::here("network_construction", "interpretation", "complete_pathway_enrichment_results.csv"))
+
+enriched_pathways |>
+  dplyr::filter(miRNA %in% all_mir_of_interest & FDR < 0.05) |>
+  kable() |>
+  kableExtra::kable_styling() |>
+  kableExtra::collapse_rows(columns = 1, target = 1)
+```
+
+Only 1 of the sPTB-associated miRNA has targets that are enriched for KEGG pathways at the FDR<0.05 level.
+
+We can also conduct pathway ORA on the whole set of sPTB genes targeted by the sPTB-associated miRNAs. 
+
+```{r}
+## take all up or down regulated miRNA in sPTB
+## group all sPTB-associated mRNA regardless of directionality
+mir_targets_sptb_down <- targets |>
+  ## only downregulated miRNA
+  dplyr::filter(miRNA %in% ptb_sncRNAs[ptb_sncRNAs$logFC < 0, ]$gene_symbol) |>
+  ## only sptb associated mRNA
+  dplyr::filter(mRNA_target %in% unique(ptb_mRNAs$ensembl_gene_id)) |>
+  dplyr::pull(mRNA_target) |>
+  unique()
+
+length(mir_targets_sptb_down)
+
+mir_targets_sptb_up <- targets |>
+  ## only UP regulated miRNA
+  dplyr::filter(miRNA %in% ptb_sncRNAs[ptb_sncRNAs$logFC > 0, ]$gene_symbol) |>
+  ## only sptb associated mRNA
+  dplyr::filter(mRNA_target %in% unique(ptb_mRNAs$ensembl_gene_id)) |>
+  dplyr::pull(mRNA_target) |>
+  unique()
+
+length(mir_targets_sptb_up)
+```
+
+First, prepare KEGG Database
+
+```{r}
+load(here::here("KEGG_pathways", "KEGG_database_20240719.Rds"))
+```
+
+Second, get NCBI (Entrez) gene IDs using our annotation file.
+
+```{r}
+entrez <- read_tsv("network_construction", "gencode_v33", "gencode.v33.metadata.EntrezGene", 
+                   col_names = c("ensembl_transcript_id_version", "ncbi_gene_id"))
+
+annot_entrez <- dplyr::inner_join(annotation |>
+                                   dplyr::mutate(ensembl_gene_id = gsub("\\..*", "", 
+                                                                        ensembl_gene_id_version)) |>
+                                    ## make sure to limit the background 
+                                    ## to the targets in the network
+                                   dplyr::filter(ensembl_gene_id %in% targets$mRNA_target), 
+                                 entrez |>
+                                   dplyr::select(ensembl_transcript_id_version, ncbi_gene_id) |>
+                                   na.omit() |>
+                                   dplyr::distinct(),
+                                 by = join_by(ensembl_transcript_id_version)) |>
+  dplyr::select(ensembl_gene_id, ncbi_gene_id, gene_name) |>
+  dplyr::distinct()
+```
+
+Now, let's conduct the ORA. We are lumping together all of the sPTB-associated targets of the down-regulated miRNA in sPTB. We are then doing the same thing with all the sPTB-associated targets of the up-regulated miRNAs. 
+
+```{r}
+limited_pathways <- keggs |>
+  dplyr::filter(PathwayID %in% keggmapper$V1) 
+
+### DOWN REGULATED
+## setup
+moduleGenes <- mir_targets_sptb_down
+  
+## select module genes as moduleGeneSet
+moduleGeneSet <- annot_entrez |>
+  dplyr::filter(ensembl_gene_id %in% moduleGenes)
+  
+## test if the module geneset 
+down_targets_enriched <- limma::kegga(moduleGeneSet$ncbi_gene_id, 
+                                      species = "Hs",
+                                      universe = annot_entrez$ncbi_gene_id,
+                                      gene.pathway = limited_pathways,
+                                      pathway.names = keggmapper,
+                                      FDR = 0.05,
+                                      restrict.universe = TRUE)
+  
+down_targets_enriched$FDR <- p.adjust(down_targets_enriched$P.DE, method = "BH")
+
+down_targets_enriched |>
+  dplyr::arrange(P.DE) |>
+  dplyr::as_tibble() |>
+  dplyr::filter(FDR < 0.1) |>
+  kable() |>
+  kableExtra::kable_styling() |>
+  kableExtra::collapse_rows(1, target = 1)
+
+### UP REGULATED
+## setup
+moduleGenes <- mir_targets_sptb_up
+  
+## select module genes as moduleGeneSet
+moduleGeneSet <- annot_entrez |>
+  dplyr::filter(ensembl_gene_id %in% moduleGenes)
+  
+## test if the module geneset 
+up_targets_enriched <- limma::kegga(moduleGeneSet$ncbi_gene_id, 
+                                      species = "Hs",
+                                      universe = annot_entrez$ncbi_gene_id,
+                                      gene.pathway = limited_pathways,
+                                      pathway.names = keggmapper,
+                                      FDR = 0.05,
+                                      restrict.universe = TRUE)
+  
+up_targets_enriched$FDR <- p.adjust(up_targets_enriched$P.DE, method = "BH")
+
+up_targets_enriched |>
+  dplyr::arrange(P.DE) |>
+  dplyr::as_tibble() |>
+  dplyr::filter(FDR < 0.1) |>
+  kable() |>
+  kableExtra::kable_styling() |>
+  kableExtra::collapse_rows(1, target = 1)
+```
+
+When we look at the down-regulated targets, these target genes are involved in immune related-processes. (Note to self for the future vitamin D analysis: some of these are linked to vitamin D, too). The up-regulated genes are not significantly associated with any pathways.
+
+```{r fig.width=5, fig.height=4}
+pathway_groups <- readxl::read_excel("/Volumes/paquette_a/mparenti/kegg_pathway_groups.xlsx")
+
+path_Data <- up_targets_enriched |>
+  dplyr::arrange(P.DE) |>
+  dplyr::as_tibble() |>
+  dplyr::filter(FDR < 0.1) |>
+  dplyr::mutate(magnitude = -log(P.DE), 
+                FDR_cat = factor(dplyr::if_else(FDR<0.05, 0, 1)),
+                pathway_name = str_replace_all(Pathway, "_", " ")) |>
+  dplyr::inner_join(pathway_groups, by = join_by(pathway_name == `Pathway Name`)) |>
+  dplyr::arrange(`Super Group`, Subgroup) 
+
+pathway_plot <- ggplot(path_Data,
+                       aes(x = factor(Subgroup),
+                           y = pathway_name)) +
+  geom_point(aes(shape = FDR_cat, size = magnitude),
+             fill = "white", color = differential_colors[2]) +
+  ylab("") +
+  xlab("") +
+  scale_shape_manual(values = c(16, 21), name = "FDR Threshold",
+                     labels = c("FDR<0.05", "FDR<0.1")) +
+  scale_size(name = "-log(p)", guide = "none") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right", 
+        legend.direction = "vertical")
+
+pathway_plot
+
+ggsave(filename = here::here("sptb_analysis", "output", "upreg_miRNA_target_pathways.pdf"), width = 5, height = 4)
+```
+
+#### Pathway Enrichment for families of genes
+
+What about just targets of the sPTB-associated C14MC?
+
+```{r}
+limited_pathways <- keggs |>
+  dplyr::filter(PathwayID %in% keggmapper$V1) 
+
+### DOWN REGULATED
+## setup
+moduleGenes <- targets |>
+  ## only downregulated C14MC miRNA
+  dplyr::filter(miRNA %in% c("hsa-miR-376c-3p", "hsa-miR-377-3p",
+                             "hsa-miR-381-3p", "hsa-miR-376a-3p")) |>
+  dplyr::pull(mRNA_target) |>
+  unique()
+
+length(moduleGenes)
+  
+## select module genes as moduleGeneSet
+moduleGeneSet <- annot_entrez |>
+  dplyr::filter(ensembl_gene_id %in% moduleGenes)
+  
+## test if the module geneset 
+c14mc_sptb_targets_enriched <- limma::kegga(moduleGeneSet$ncbi_gene_id, 
+                                            species = "Hs",
+                                            universe = annot_entrez$ncbi_gene_id,
+                                            gene.pathway = limited_pathways,
+                                            pathway.names = keggmapper,
+                                            FDR = 0.05,
+                                            restrict.universe = TRUE)
+  
+c14mc_sptb_targets_enriched$FDR <- p.adjust(c14mc_sptb_targets_enriched$P.DE, method = "BH")
+
+c14mc_sptb_targets_enriched |>
+  dplyr::arrange(P.DE) |>
+  dplyr::as_tibble() |>
+  dplyr::filter(FDR < 0.1) |>
+  kable() |>
+  kableExtra::kable_styling() 
+
+```
+
+Let's look at the genes driving oxidative phosphorylation.
+
+```{r}
+## now, get the genes ENTREZ/NCBI IDs
+entrez_hsa00190 <- keggs[keggs$PathwayID == "hsa00190", ]$GeneID |> as.vector()
+
+## now, pull the list of gene names for each
+
+### MICRORNA TARGETS ###
+annot_entrez |>
+  ## genes in pathway AND targeted by sPTB-C14MC
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & ensembl_gene_id %in% moduleGenes) |>
+  dplyr::pull(gene_name) |>
+  sort()
+
+## split by individual miRNAs
+annot_entrez |>
+  ## genes in pathway AND targeted by sPTB-C14MC
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & 
+                  ensembl_gene_id %in% c(targets[targets$miRNA == "hsa-miR-376a-3p", ]$mRNA_target)) |>
+  dplyr::pull(gene_name) |>
+  sort()
+
+annot_entrez |>
+  ## genes in pathway AND targeted by sPTB-C14MC
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & 
+                  ensembl_gene_id %in% c(targets[targets$miRNA == "hsa-miR-376c-3p", ]$mRNA_target)) |>
+  dplyr::pull(gene_name) |>
+  sort()
+
+annot_entrez |>
+  ## genes in pathway AND targeted by sPTB-C14MC
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & 
+                  ensembl_gene_id %in% c(targets[targets$miRNA == "hsa-miR-377-3p", ]$mRNA_target)) |>
+  dplyr::pull(gene_name) |>
+  sort()
+
+annot_entrez |>
+  ## genes in pathway AND targeted by sPTB-C14MC
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & 
+                  ensembl_gene_id %in% c(targets[targets$miRNA == "hsa-miR-381-3p", ]$mRNA_target)) |>
+  dplyr::pull(gene_name) |>
+  sort()
+
+### PRETERM BIRTH ASSOCIATED ###
+annot_entrez |>
+  ## genes in pathway AND sPTB-associated DEG
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & ensembl_gene_id %in% ptb_mRNAs$ensembl_gene_id) |>
+  dplyr::pull(gene_name) |>
+  sort()
+
+annot_entrez |>
+  ## genes in pathway AND in network
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & ensembl_gene_id %in% targets$mRNA_target) |>
+  dplyr::pull(gene_name) |>
+  sort()
+```
+
+Get the gene IDS to make the annotated KEGG Pathway. 
+
+```{r}
+oxphos_in_pathway <- annot_entrez |>
+  ## genes in pathway and in network
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & ensembl_gene_id %in% targets$mRNA_target) |>
+  dplyr::pull(ncbi_gene_id) |>
+  sort()
+
+oxphos_in_sPTB_C14MC <- annot_entrez |>
+  ## genes in pathway and in network
+  dplyr::filter(ncbi_gene_id %in% entrez_hsa00190 & ensembl_gene_id %in% moduleGenes) |>
+  dplyr::pull(ncbi_gene_id) |>
+  sort()
+
+oxphos_in_pathway[!oxphos_in_pathway %in% oxphos_in_sPTB_C14MC]
+```
+
+What about the full complement of the C14MC?
+
+```{r}
+## setup
+moduleGenes <- targets |>
+  dplyr::filter(miRNA %in% c(miRNA_clusters |> 
+                  dplyr::filter(cluster == "C14MC") |> 
+                  dplyr::pull(Name) 
+                |> unique())) |>
+  dplyr::pull(mRNA_target) |>
+  unique()
+  
+length(moduleGenes)
+```
+
+These target more than 5000 genes, which is kind of too many for ORA.
+
+Look at the sPTB-associated let-7 family.
+
+```{r}
+moduleGenes <- targets |>
+  ## only downregulated let-7 family miRNA
+  dplyr::filter(miRNA %in% c("hsa-let-7d-5p", "hsa-let-7f-5p", "hsa-let-7g-5p", 
+                             "hsa-let-7i-5p")) |>
+  dplyr::pull(mRNA_target) |>
+  unique()
+
+length(moduleGenes)
+  
+## select module genes as moduleGeneSet
+moduleGeneSet <- annot_entrez |>
+  dplyr::filter(ensembl_gene_id %in% moduleGenes)
+  
+## test if the module geneset 
+let7_targets_enriched <- limma::kegga(moduleGeneSet$ncbi_gene_id, 
+                                      species = "Hs",
+                                      universe = annot_entrez$ncbi_gene_id,
+                                      gene.pathway = limited_pathways,
+                                      pathway.names = keggmapper,
+                                      FDR = 0.05,
+                                      restrict.universe = TRUE)
+  
+let7_targets_enriched$FDR <- p.adjust(let7_targets_enriched$P.DE, method = "BH")
+
+let7_targets_enriched |>
+  dplyr::arrange(P.DE) |>
+  dplyr::as_tibble() |>
+  dplyr::filter(FDR < 0.1) |>
+  kable() |>
+  kableExtra::kable_styling() 
+```
+
+## Up- vs down-regulated miRNA and the sPTB subnetwork
+
+First, we need the TRN to get the IDs for the transcription factors, because we want to identify them in the figures.
+
+```{r}
+TRNModel <-  read.csv("/Volumes/paquette_a/mparenti/resources/Placental_Gene_TF_Associations.csv")
+TRNModel$targetGene <- as.character(TRNModel$targetGene)
+TRNModel$TF <- as.character(TRNModel$TF)
+```
+
+Start with the up-regulated miRNA.
+
+```{r}
+sptb_up_network <- targets |>
+  dplyr::filter(miRNA %in% ptb_sncRNAs[ptb_sncRNAs$logFC>0, ]$gene_symbol) |>
+  dplyr::filter(mRNA_target %in% unique(ptb_mRNAs$ensembl_gene_id))
+
+sptb_up_network$miRNA |> unique() |> length()
+sptb_up_network$mRNA_target |> unique() |> length()
+
+unweighted_graph <- igraph::graph_from_edgelist(el = sptb_up_network |> dplyr::select(all_of(c("miRNA", "mRNA_target"))) |> as.matrix(), 
+                      directed = TRUE) 
+## make it bipartite
+## make bipartite by making a vector of types
+named_types <- dplyr::if_else(V(unweighted_graph)$name %in% sptb_up_network$miRNA, 0, 1)
+names(named_types) <- V(unweighted_graph)$name
+
+V(unweighted_graph)$type <- named_types
+
+is_bipartite(unweighted_graph)
+
+## add weights: must be positive for layout_with_fr and layout_with_kk
+E(unweighted_graph)$weight <- abs(sptb_up_network$cor)
+
+weights <- sptb_up_network |>
+  dplyr::select(c(from = miRNA, to = mRNA_target, cor))
+
+set.seed(2024)
+
+node_layout <- igraph::layout_with_fr(unweighted_graph) |> #can also try layout_with_dh(); layout_with_graphopt
+  as_tibble() |>
+  dplyr::mutate(node = V(unweighted_graph)$name) |>
+  dplyr::mutate(is_miRNA = factor(dplyr::if_else(node %in% unique(ptb_sncRNAs$gene_symbol), "miRNA", "target"))) |>
+  ## make a variables for effectsize
+  dplyr::left_join(ptb_sncRNAs |> 
+                     dplyr::select(node = gene_symbol, logFC_miRNA = logFC,
+                                   FDR_miRNA = FDR)) |>
+  dplyr::left_join(ptb_mRNAs |> 
+                     dplyr::select(node = ensembl_gene_id, gene_name, 
+                                   logFC_mRNA = logFC,
+                                   FDR_mRNA = FDR)) |>
+  ## pull the logFC and FDR for each partition into a single variable
+  dplyr::mutate(logFC = dplyr::case_when(is_miRNA == "miRNA" & is.na(logFC_miRNA) == FALSE ~ logFC_miRNA,
+                                         is_miRNA == "target" & is.na(logFC_mRNA) == FALSE ~ logFC_mRNA,
+                                         is_miRNA == "target" & is.na(logFC_mRNA) == TRUE ~ NA),
+                FDR = dplyr::case_when(is_miRNA == "miRNA" & is.na(FDR_miRNA) == FALSE ~ FDR_miRNA,
+                                       is_miRNA == "target" & is.na(FDR_mRNA) == FALSE ~ FDR_mRNA,
+                                       is_miRNA == "target" & is.na(FDR_mRNA) == TRUE ~ NA)) |>
+  ## make a categorical version in case we need to have just up/down by partition
+  dplyr::mutate(logFC_cat = dplyr::case_when(is.na(logFC) == FALSE & logFC<0 ~ "down", 
+                                             is.na(logFC) == FALSE & logFC>0 ~ "up",
+                                             is.na(logFC) == TRUE ~ "none") |>
+                  factor(levels = c("up", "down", "none"))) |>
+  dplyr::mutate(
+    ## make a categorical version in case we need to have just up/down by partition
+    type_logFC = factor(interaction(logFC_cat, is_miRNA)),
+    ## make variable so we can just lable miRNAs
+    only_miRNA_label = dplyr::if_else(is_miRNA == "miRNA", str_replace(node, "hsa-", ""), "."),
+    ## make a variable so we can ID "placenta enhanced" genes from HPA
+    placenta_specific = dplyr::if_else(is_miRNA == "target" & node %in% placenta_specific$Ensembl, 1, 0) |> 
+                  factor(),
+    ## make variable so we can label C14MC microRNA
+    is_C14MC = factor(dplyr::if_else(node %in% miRNA_clusters[miRNA_clusters$cluster == "C14MC", ]$Name, 1, 0)),
+    ## make variable so we can lable let-7 family
+    is_let7 = factor(dplyr::if_else(stringr::str_detect(node, "let-7"), 1, 0))
+                ) |>
+  ## generate a variable for "type" to split targets into TFs and other protein coding genes
+  dplyr::mutate(type = dplyr::case_when(is_miRNA == "miRNA" ~ "miRNA",
+                                        is_miRNA == "target" & gene_name %in% TRNModel$TF ~ "TF",
+                                        is_miRNA == "target" & !gene_name %in% TRNModel$TF ~ "gene") |>
+                  factor(levels = c("miRNA", "TF", "gene")), 
+                mir_family = dplyr::case_when(is_miRNA == "miRNA" & is_C14MC == "1" ~ "C14MC",
+                                              is_miRNA == "miRNA" & is_let7 == "1" ~ "let-7",
+                                              is_miRNA == "miRNA" & is_C14MC == "0" & is_let7 == "0" ~ "other miRNA", 
+                                              is_miRNA != "miRNA" ~ "target gene") |> factor()) |>
+  ## make some more variables now that we have type, label_all, label_miRNA_TFs
+  dplyr::mutate(
+    label_all = dplyr::if_else(is_miRNA == "miRNA", str_replace(node, "hsa-", ""), gene_name),
+    label_miRNA_TFs = dplyr::case_when(type == "miRNA" ~ str_replace(node, "hsa-", ""), 
+                                       type == "TF" ~ gene_name,
+                                       type == "target" ~ "."),
+    label_TFs = dplyr::if_else(type == "TF", gene_name, ".")
+  ) |>
+  dplyr::distinct()
+
+edges_layout <- igraph::as_data_frame(unweighted_graph)
+edges_layout$from.x <- node_layout$V1[match(edges_layout$from, node_layout$node)]  #  match the from locations from the node data.frame we previously connected
+edges_layout$from.y <- node_layout$V2[match(edges_layout$from, node_layout$node)]
+edges_layout$to.x <- node_layout$V1[match(edges_layout$to, node_layout$node)]  #  match the to locations from the node data.frame we previously connected
+edges_layout$to.y <- node_layout$V2[match(edges_layout$to, node_layout$node)]
+
+weighted_graph <- dplyr::left_join(edges_layout, weights, by = join_by(from, to))
+```
+
+Plot the up-regulated miRNA network (targeting predominately down-regulated targets).
+
+```{r, fig.height=6, fig.width=10}
+upreg_mir_subnetwork <- ggplot() +
+  geom_segment(data = weighted_graph,
+               aes(x = from.x, 
+                   xend = to.x, 
+                   y = from.y, 
+                   yend = to.y, 
+                   alpha = cor), 
+               linewidth = .5,
+               lineend = "square",
+               linejoin = "mitre",
+               color = "gray30",
+               arrow = arrow(length = unit(0.2, "cm"), 
+                             type = "closed")) + ## arrow
+  ## now, giant points for outlines for C14MC and let-7 family
+  geom_point(data = node_layout |> 
+               ## just let-7 family
+               dplyr::filter(is_let7 == "1"), 
+             aes(x = V1, y = V2, 
+                 size = -log10(FDR)*8), 
+             color = "brown2", 
+             shape = 18) + 
+  geom_point(data = node_layout |> 
+               ## just let-7 family
+               dplyr::filter(is_C14MC == "1"), 
+             aes(x = V1, y = V2,  
+                 size = -log10(FDR)*8), 
+             color = "turquoise3",
+             shape = 18) + 
+  ## now, all the nodes
+  geom_point(data = node_layout |> 
+               ## first arrange so logFC_cat == "none" on top
+               dplyr::arrange(desc(logFC_cat)) |>
+               ## arrange to plot miRNA at the end
+               dplyr::arrange(desc(type)), 
+             aes(x = V1, y = V2, fill = logFC, 
+                 shape = type, size = -log10(FDR)),
+             color = "white") + 
+  ## now, print miRNA lables
+  geom_text_repel(data = node_layout |> dplyr::filter(only_miRNA_label != "."),
+                  aes(x = V1, 
+                      y = V2, 
+                      label = only_miRNA_label), 
+                  size = 4,
+                  bg.color = "white", ## text outline color
+                  bg.r = .15) + # add the name
+  ## print only TFS
+  geom_text_repel(data = node_layout |> dplyr::filter(label_TFs != "."),
+                  aes(x = V1, y = V2, label = label_TFs),
+                  size = 2,
+                  bg.color = "white", ## text outline color
+                  bg.r = .15) + # add the name
+  ## Print all genes
+  # geom_text_repel(data = node_layout |> dplyr::filter(is.na(gene_name) != TRUE),
+  #                 aes(x = V1, y = V2, label = gene_name), 
+  #                 size = 3.5,
+  #                 bg.color = "white", ## text outline color
+  #                 bg.r = .15) + # add the name
+  scale_alpha(range = c(0.2, 1), transform = "reverse", # n.breaks = 3,
+              name = "Edge strength\n(rho)") +
+  scale_fill_gradientn(colors = scico::scico(11, palette = "bam"),
+                       limits = c(-1.7, 1.7), 
+                       name = "Association with\nsPTB (logFC)") +
+  scale_shape_manual(values = c(23, 24, 21), name = "Type") +
+  scale_size_continuous(name = "FDR", breaks = c(2,3, 4),
+                        labels = c("0.01", "0.001", "0.0001"),
+                        range = c(1, 5)) +
+  guides(shape = guide_legend(override.aes = list(fill = "#132330", size = 3))) +
+  guides(size = guide_legend(override.aes = list(fill = "#132330", shape = 21))) +
+  
+  ## get rid of some of the padding/whitespace
+  scale_y_continuous(expand = expansion(mult = 0.01)) +
+  scale_x_continuous(expand = expansion(mult = 0.01)) +
+  theme_bw(base_size = 10) +  # use the ggplot black and white theme
+  theme(
+    legend.position = "right",
+    axis.text.x = element_blank(),  # remove x-axis text
+    axis.text.y = element_blank(),  # remove y-axis text
+    axis.ticks = element_blank(),   # remove axis ticks
+    axis.title.x = element_blank(), # remove x-axis labels
+    axis.title.y = element_blank(), # remove y-axis labels
+    # panel.background = element_blank(), 
+    panel.border = element_blank(), 
+    # plot.background = element_blank(),
+    panel.grid.major = element_blank(), #remove major-grid labels
+    panel.grid.minor = element_blank()  #remove minor-grid labels
+    )
+
+upreg_mir_subnetwork
+
+upreg_mir_subnetwork + theme(legend.position = "none") 
+```
+
+Now, the down-regulated miRNA.
+
+```{r}
+sptb_down_network <- targets |>
+  dplyr::filter(miRNA %in% ptb_sncRNAs[ptb_sncRNAs$logFC<0, ]$gene_symbol) |>
+  dplyr::filter(mRNA_target %in% unique(ptb_mRNAs$ensembl_gene_id))
+
+sptb_down_network$miRNA |> unique() |> length()
+sptb_down_network$mRNA_target |> unique() |> length()
+
+unweighted_graph <- igraph::graph_from_edgelist(el = sptb_down_network |> dplyr::select(all_of(c("miRNA", "mRNA_target"))) |> as.matrix(), 
+                      directed = TRUE) 
+## make it bipartite
+## make bipartite by making a vector of types
+named_types <- dplyr::if_else(V(unweighted_graph)$name %in% sptb_down_network$miRNA, 0, 1)
+names(named_types) <- V(unweighted_graph)$name
+
+V(unweighted_graph)$type <- named_types
+
+is_bipartite(unweighted_graph)
+
+## add weights: must be positive for layout_with_fr and layout_with_kk
+E(unweighted_graph)$weight <- abs(sptb_down_network$cor)
+
+weights <- sptb_down_network |>
+  dplyr::select(c(from = miRNA, to = mRNA_target, cor))
+
+set.seed(2024)
+
+node_layout <- igraph::layout_with_fr(unweighted_graph) |> #can also try layout_with_dh(); layout_with_graphopt
+  as_tibble() |>
+  dplyr::mutate(node = V(unweighted_graph)$name) |>
+  dplyr::mutate(is_miRNA = factor(dplyr::if_else(node %in% unique(ptb_sncRNAs$gene_symbol), "miRNA", "target"))) |>
+  ## make a variables for effectsize
+  dplyr::left_join(ptb_sncRNAs |> 
+                     dplyr::select(node = gene_symbol, logFC_miRNA = logFC,
+                                   FDR_miRNA = FDR)) |>
+  dplyr::left_join(ptb_mRNAs |> 
+                     dplyr::select(node = ensembl_gene_id, gene_name, 
+                                   logFC_mRNA = logFC,
+                                   FDR_mRNA = FDR)) |>
+  ## pull the logFC and FDR for each partition into a single variable
+  dplyr::mutate(logFC = dplyr::case_when(is_miRNA == "miRNA" & is.na(logFC_miRNA) == FALSE ~ logFC_miRNA,
+                                         is_miRNA == "target" & is.na(logFC_mRNA) == FALSE ~ logFC_mRNA,
+                                         is_miRNA == "target" & is.na(logFC_mRNA) == TRUE ~ NA),
+                FDR = dplyr::case_when(is_miRNA == "miRNA" & is.na(FDR_miRNA) == FALSE ~ FDR_miRNA,
+                                       is_miRNA == "target" & is.na(FDR_mRNA) == FALSE ~ FDR_mRNA,
+                                       is_miRNA == "target" & is.na(FDR_mRNA) == TRUE ~ NA)) |>
+  ## make a categorical version in case we need to have just up/down by partition
+  dplyr::mutate(logFC_cat = dplyr::case_when(is.na(logFC) == FALSE & logFC<0 ~ "down", 
+                                             is.na(logFC) == FALSE & logFC>0 ~ "up",
+                                             is.na(logFC) == TRUE ~ "none") |>
+                  factor(levels = c("up", "down", "none"))) |>
+  dplyr::mutate(
+    ## make a categorical version in case we need to have just up/down by partition
+    type_logFC = factor(interaction(logFC_cat, is_miRNA)),
+    ## make variable so we can just lable miRNAs
+    only_miRNA_label = dplyr::if_else(is_miRNA == "miRNA", str_replace(node, "hsa-", ""), "."),
+    ## make a variable so we can ID "placenta enhanced" genes from HPA
+    placenta_specific = dplyr::if_else(is_miRNA == "target" & node %in% placenta_specific$Ensembl, 1, 0) |> 
+                  factor(),
+    ## make variable so we can label C14MC microRNA
+    is_C14MC = factor(dplyr::if_else(node %in% miRNA_clusters[miRNA_clusters$cluster == "C14MC", ]$Name, 1, 0)),
+    ## make variable so we can lable let-7 family
+    is_let7 = factor(dplyr::if_else(stringr::str_detect(node, "let-7"), 1, 0))
+                ) |>
+  ## generate a variable for "type" to split targets into TFs and other protein coding genes
+  dplyr::mutate(type = dplyr::case_when(is_miRNA == "miRNA" ~ "miRNA",
+                                        is_miRNA == "target" & gene_name %in% TRNModel$TF ~ "TF",
+                                        is_miRNA == "target" & !gene_name %in% TRNModel$TF ~ "gene") |>
+                  factor(levels = c("miRNA", "TF", "gene")), 
+                mir_family = dplyr::case_when(is_miRNA == "miRNA" & is_C14MC == "1" ~ "C14MC",
+                                              is_miRNA == "miRNA" & is_let7 == "1" ~ "let-7",
+                                              is_miRNA == "miRNA" & is_C14MC == "0" & is_let7 == "0" ~ "other miRNA", 
+                                              is_miRNA != "miRNA" ~ "target gene") |> factor()) |>
+  ## make some more variables now that we have type, label_all, label_miRNA_TFs
+  dplyr::mutate(
+    label_all = dplyr::if_else(is_miRNA == "miRNA", str_replace(node, "hsa-", ""), gene_name),
+    label_miRNA_TFs = dplyr::case_when(type == "miRNA" ~ str_replace(node, "hsa-", ""), 
+                                       type == "TF" ~ gene_name,
+                                       type == "target" ~ "."),
+    label_TFs = dplyr::if_else(type == "TF", gene_name, ".")
+  ) |>
+  dplyr::distinct()
+
+edges_layout <- igraph::as_data_frame(unweighted_graph)
+edges_layout$from.x <- node_layout$V1[match(edges_layout$from, node_layout$node)]  #  match the from locations from the node data.frame we previously connected
+edges_layout$from.y <- node_layout$V2[match(edges_layout$from, node_layout$node)]
+edges_layout$to.x <- node_layout$V1[match(edges_layout$to, node_layout$node)]  #  match the to locations from the node data.frame we previously connected
+edges_layout$to.y <- node_layout$V2[match(edges_layout$to, node_layout$node)]
+
+weighted_graph <- dplyr::left_join(edges_layout, weights, by = join_by(from, to))
+```
+
+Now, plot the down-regulated microRNA (targeting predominately up-regulated protein coding genes).
+
+```{r, fig.height=6, fig.width=10}
+downreg_mir_subnetwork <- ggplot() +
+  geom_segment(data = weighted_graph,
+               aes(x = from.x, 
+                   xend = to.x, 
+                   y = from.y, 
+                   yend = to.y, 
+                   alpha = cor), 
+               linewidth = .5,
+               lineend = "square",
+               linejoin = "mitre",
+               color = "gray30",
+               arrow = arrow(length = unit(0.2, "cm"), 
+                             type = "closed")) + ## arrow
+  ## now, giant points for outlines for C14MC and let-7 family
+  geom_point(data = node_layout |> 
+               ## just let-7 family
+               dplyr::filter(is_let7 == "1"), 
+             aes(x = V1, y = V2, 
+                 size = -log10(FDR)*8), 
+             color = "brown2", 
+             shape = 18) + 
+  geom_point(data = node_layout |> 
+               ## just let-7 family
+               dplyr::filter(is_C14MC == "1"), 
+             aes(x = V1, y = V2,  
+                 size = -log10(FDR)*8), 
+             color = "turquoise3",
+             shape = 18) + 
+  ## now, all the nodes
+  geom_point(data = node_layout |> 
+               ## first arrange so logFC_cat == "none" on top
+               dplyr::arrange(desc(logFC_cat)) |>
+               ## arrange to plot miRNA at the end
+               dplyr::arrange(desc(type)), 
+             aes(x = V1, y = V2, fill = logFC, 
+                 shape = type, size = -log10(FDR)),
+             color = "white") + 
+  ## now, print miRNA lables
+  geom_text_repel(data = node_layout |> dplyr::filter(only_miRNA_label != "."),
+                  aes(x = V1, 
+                      y = V2, 
+                      label = only_miRNA_label,
+                      color = mir_family), 
+                  size = 4,
+                  bg.color = "white", ## text outline color
+                  bg.r = .15) + # add the name
+  ## print only TFS
+  geom_text_repel(data = node_layout |> dplyr::filter(label_TFs != "."),
+                  aes(x = V1, y = V2, label = label_TFs),
+                  size = 2,
+                  bg.color = "white", ## text outline color
+                  bg.r = .15) + # add the name
+  ## print all genes
+  # geom_text_repel(data = node_layout |> dplyr::filter(is.na(gene_name) != TRUE),
+  #                 aes(x = V1, y = V2, label = gene_name),
+  #                 size = 3.5,
+  #                 bg.color = "white", ## text outline color
+  #                 bg.r = .15) +
+  scale_color_manual(values = c("turquoise3", "brown2", "black"),
+                        guide = "none") +
+  scale_alpha(range = c(0.2, 1), transform = "reverse", # n.breaks = 3,
+              name = "Edge strength\n(rho)") +
+  scale_fill_gradientn(colors = scico::scico(11, palette = "bam"),
+                       limits = c(-1.7, 1.7), 
+                       name = "Association with\nsPTB (logFC)") +
+  scale_shape_manual(values = c(23, 24, 21), name = "Type") +
+  scale_size_continuous(name = "FDR", breaks = c(2, 3, 4),
+                        labels = c("0.01", "0.001", "0.0001"),
+                        range = c(1, 5)) +
+  guides(shape = guide_legend(override.aes = list(fill = "#132330", size = 3))) +
+  guides(size = guide_legend(override.aes = list(fill = "#132330", shape = 21))) +
+  ## get rid of some of the padding/whitespace
+  scale_y_continuous(expand = expansion(mult = 0.01)) +
+  scale_x_continuous(expand = expansion(mult = 0.01)) +
+  theme_bw(base_size = 10) +  # use the ggplot black and white theme
+  theme(
+    legend.position = "right",
+    axis.text.x = element_blank(),  # remove x-axis text
+    axis.text.y = element_blank(),  # remove y-axis text
+    axis.ticks = element_blank(),   # remove axis ticks
+    axis.title.x = element_blank(), # remove x-axis labels
+    axis.title.y = element_blank(), # remove y-axis labels
+    # panel.background = element_blank(), 
+    panel.border = element_blank(), 
+    # plot.background = element_blank(),
+    panel.grid.major = element_blank(), #remove major-grid labels
+    panel.grid.minor = element_blank()  #remove minor-grid labels
+    )
+
+downreg_mir_subnetwork
+
+downreg_mir_subnetwork + theme(legend.position = "none")
+```
+
+Plot them together as a panel.
+
+```{r, fig.width=7.5, fig.height=9}
+ggpubr::ggarrange(upreg_mir_subnetwork,
+                  downreg_mir_subnetwork,
+                  ncol = 1, 
+                  labels = "AUTO",
+                  widths = c(3.5, 3),
+                  common.legend = TRUE, 
+                  legend = "right")
+
+ggsave(filename = here::here("sptb_analysis", "output", "sptb_subnetwork_panel.pdf"),
+       width = 7.5, height = 8.75, units = "in")
+```
+
+## Seahorse Results
+
+```{r fig.width = 6.5, fig.height=3.5}
+seahorse_ocr <- read_csv("inhibition_seahorse/oxphos_experiment_2_ocr_parameter_data_long.csv")
+
+## first, get parameters from Evan's file
+
+stats_df <- tibble(
+  parameter = c("ATP-linked\nRespiration", "ATP-linked\nRespiration", "Basal\nRespiration"),
+  xmin = c("Negative\nControl", "Negative\nControl", "Negative\nControl"),
+  xmax = c("miR-376c-3p", "miR-377-3p", "miR-377-3p"),
+  label = c("list(~italic(P) == 0.035)", "list(~italic(P) == 0.027)", "list(~italic(P) == 0.035)"),
+  y.position = c(0.5, 0.6, 0.8)
+)
+
+seahorse_ocr |>
+  dplyr::filter(parameter %in% c("ATP linked respiration", "basal respiration")) |>
+  dplyr::mutate(
+    parameter = dplyr::replace_values(
+      parameter,
+      "ATP linked respiration" ~ "ATP-linked\nRespiration", 
+      "basal respiration" ~ "Basal\nRespiration"
+      ) |>
+      factor(levels = c("Basal\nRespiration", "ATP-linked\nRespiration")),
+    mir_name = dplyr::if_else(mir_name == "Negative Control",
+                              "Negative\nControl", 
+                              mir_name) |>
+      factor(levels = c("Negative\nControl", "miR-376c-3p", "miR-377-3p", "miR-381-3p"))
+    ) |>
+  ggplot() +
+  aes(x = mir_name, 
+      y = resp_value) +
+  ## axis
+  ylab("Oxygen Consumption Rate\n(pmol/min/ug protein)") +
+  xlab(NULL) +
+  ## statistics + data
+  stat_summary(fun = "mean", geom = "bar", 
+               aes(fill = mir_name, 
+                   color = mir_name)) +
+  stat_summary(fun.data = "mean_sdl", fun.args = list(mult = 1), 
+               geom = "errorbar", width = 0.2,
+               linewidth = 1,
+               aes(color = mir_name)) +
+   geom_jitter(#fill = "#00000099",
+     #aes(fill = mir_name), 
+              height = 0, ## CRTICAL so the rate is correct
+              width = 0.2, ## allows some horizontal movement
+              color = "black", 
+              alpha = 0.7,
+              shape = 16, 
+              size = 2) +
+  ## add some padding for the annotation
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  ## stats annotation
+  ggpubr::geom_bracket(
+    data = stats_df, 
+    aes(
+      xmin = xmin, 
+      xmax = xmax, 
+      label = label, 
+      y.position = y.position
+    ), 
+    label.size = 3, 
+    type = "expression") +
+  ## themes + scales
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_classic(base_size = 10) +
+  theme(
+    legend.position = "none",
+    strip.text = element_markdown(),
+    axis.title = element_markdown(),
+    axis.text.x.bottom = element_markdown(angle = 45, hjust = 1)) +
+  facet_wrap(vars(parameter), scale = "free_y")
+
+ggsave(filename = here::here("sptb_analysis", "output", "seahorse_results.pdf"), width = 6.5, height = 3.5)
+```
