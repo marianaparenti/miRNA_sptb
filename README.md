@@ -18,21 +18,10 @@ The complete differential microRNA expression analysis was conducted in the `DEG
 ```
 .
 └── miRNA_sPTB/
+    ├── KEGG_pathways/
+    │   ├── kegg_pathways_cleaning.R
+    │   └── KEGG_database_20240719.Rds
     ├── network_construction/
-    │   ├── TargetScan/
-    │   │   ├── Summary_Counts.all_predictions.txt
-    │   │   ├── Gene_info.txt
-    │   │   └── miR_Family_Info.txt
-    │   ├── miRDB/
-    │   │   └── miRDB_v6.0_prediction_results.txt
-    │   ├── gencode_v33/
-    │   │   ├── gencode.v33.annotation.gff3
-    │   │   ├── gencode.v33.metadata.EntrezGene
-    │   │   ├── gencode.v33.metadata.HGNC
-    │   │   └── genecode.v33.metadata.RefSeq
-    │   ├── KEGG_pathways/
-    │   │   ├── kegg_pathways_cleaning.R
-    │   │   └── KEGG_database_20240719.Rds
     │   ├── 01_clean_sequencing_data.Rmd
     │   ├── 02_clean_targetscan_mirdb.Rmd
     │   ├── 03_network_construction.Rmd
@@ -43,8 +32,6 @@ The complete differential microRNA expression analysis was conducted in the `DEG
 ```
 
 ### Data availability
-
-Data accessed from publicly accessible databases was downloaded and saved in directories in this repository so that the same versions are available here. 
 
 Human participant data from the Conditions Affecting Neurocognitive Development and Learning in Early childhood (CANDLE) cohort are accessible through the following pathways: 
 
