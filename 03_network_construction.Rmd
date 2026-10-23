@@ -1,0 +1,116 @@
+---
+title: "Establishing the Network of MicroRNAs and their mRNA Targets in the CANDLE Cohort"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+## Objective
+
+To build a transcriptome-wide, placental miRNA-–mRNA regulatory network using CANDLE data.
+
+```{r}
+library(tidyverse)  ## tidy data framework, ggplot2, pipes
+library(assertthat) ## sanity checks
+library(here)       ## sets path nicely for markdown
+library(broom)      ## for tidy correlation test results
+library(parallel)   ## to paralellize the Spearman correlations
+```
+ 
+
+```{r}
+## read data
+## miRNA expression: loads miRNA, CPM, covar
+load(file = here::here("network_construction/intermediateData/clean_miRNA.Rdata"))
+## mRNA expression
+load(file = here::here("network_construction/intermediateData/clean_RNAseq.Rdata"))
+## mRNA targets of miRNA
+load(file = here::here("network_construction/intermediateData/predicted_targets_complete.RData"))
+
+## read annotation files
+## use the annotation file from the mRNA seq alignment
+## use the annotation file from the mRNA seq alignment
+annot <- read_csv(here::here("network_construction/intermediateData/annotation_proteincoding_refseq.csv"))
+```
+
+## Network Analysis
+
+First, we will identify the list of predicted targets (see `02_clean_targetscan_mirdb.Rmd`). 
+Then, we will write a function to do cor_test on each set of putative pairs. 
+
+```{r}
+edgelist <- simplified_targets |>
+  ## limit to only the miRNA and mRNA we have data on
+  dplyr::filter(ensembl_gene_id %in% annot_mRNA$ENSEMBL) |>
+  dplyr::filter(miRNA %in% annot_mir$name) |>
+  dplyr::distinct()
+
+## unique sets of pairs
+unique_pairs <- edgelist$miRNA_mRNA_pair |> unique()
+
+## now, make a single data set with all miRNA and mRNA
+joint_data <- dplyr::full_join(
+  ## start with miRNA
+  CPM_mir |>
+    t() |>
+    as.data.frame() |>
+    tibble::rownames_to_column(var = "pathways_id"), 
+  ## now, mRNA. Note names will be ENSEMBL ids, need to fix after correlations next
+  CPM_mRNA |>
+    t() |>
+    as.data.frame() |>
+    tibble::rownames_to_column(var = "pathways_id"),
+  by = join_by(pathways_id)
+)
+
+rm(RNASeq, miRNA, CPM_mir, CPM_mRNA, simplified_targets, union_of_targets)
+```
+
+```{r eval=FALSE, include=TRUE}
+weights <- mclapply(unique_pairs, function(x) {
+  ## get names as character strings
+  miRNA_name <- unlist(strsplit(x, " "))[1]
+  mRNA_name <- unlist(strsplit(x, " "))[2]
+  
+  temp <- with(joint_data, cor.test(get(miRNA_name), get(mRNA_name),
+                                    method = "spearman", 
+                                    exact = FALSE)) |>
+    broom::tidy() |>
+    dplyr::mutate(miRNA = miRNA_name, mRNA_target = mRNA_name)
+}) |>
+  dplyr::bind_rows()
+```
+
+This takes a long time to run locally (approximately an hour and a half), so we will write `weights` to a file. 
+
+```{r eval=FALSE, include=TRUE}
+write_csv(weights, here::here("network_construction", "weights_allPredictedPairs.csv"))
+```
+
+Now, only retain negative, two-tailed Spearman correlations that meet FDR<0.05.
+
+```{r}
+weights <- read_csv(here::here("network_construction", "weights_allPredictedPairs.csv"))
+
+edges <- weights |>
+  dplyr::mutate(miRNA_mRNA_pair = paste(miRNA, mRNA_target, sep = " ")) |>
+  dplyr::select(miRNA, mRNA_target, miRNA_mRNA_pair, cor = estimate, p.value) |>
+  dplyr::mutate(FDR = p.adjust(p.value, method = "BH")) |>
+  dplyr::filter(cor < 0) |>
+  dplyr::filter(FDR < 0.05) |>
+  dplyr::distinct()
+```
+
+Write the edge list and nodes to CSV for Cytoscape or further analysis in `R` using igraph. 
+
+```{r}
+nodes <- dplyr::bind_rows(tibble::tibble(node = annot_mir$name, 
+                                         type = "miRNA"),
+                          tibble::tibble(node = annot_mRNA$ENSEMBL, 
+                                         type = "target")
+                          ) |>
+  dplyr::filter(node %in% c(unique(edges$miRNA), unique(edges$mRNA_target)))
+
+write_csv(nodes, here::here("network_construction", "allPairs_nodes_20240719.csv"))
+write_csv(edges, here::here("network_construction", "allPairs_edges_20240719.csv"))
+```

@@ -1,0 +1,314 @@
+---
+title: "Generating the Network of MicroRNAs and their mRNA Targets in the CANDLE Cohort"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+## Objective
+
+To clean covariates, microRNA, and mRNA sequencing data needed to build transcriptome-wide, placental miRNA-–mRNA regulatory networks using CANDLE data.
+
+We will use the implementation of ComBat-seq from the `sva` package. 
+
+```{r}
+library(tidyverse)  ## tidy data framework, ggplot2, pipes
+library(assertthat) ## sanity checks
+library(here)       ## sets path nicely for markdown
+library(edgeR)      ## differential expression analysis; limma/voom dependencies
+library(sva)        ## for ComBat-seq
+library(table1)     ## for labels function for table1 style tables
+library(arsenal)    ## for nicely formatted demographics table
+```
+ 
+First, we will load all the data.
+
+```{r}
+## Load covariates from prior pulls
+## First: Prior data from pull p0047, used in the AJOG sPTB paper
+p0047_candle <- readr::read_csv("/Volumes/paquette_a/mparenti/sPTB_PlacentalTranscriptome_CANDLE/RawData/p0047_candle.csv")
+
+## Second: from pull p0109, used in the vitamin D analysis
+p0109_data <- readr::read_csv("/Volumes/paquette_a/mparenti/sPTB_PlacentalTranscriptome_CANDLE/RawData/p0109_data.csv")
+
+## mRNA data
+load("/Volumes/paquette_a/mparenti/sPTB_PlacentalTranscriptome_CANDLE/RawData/candle_20200226.Rdata")
+## loads annot, batches, candle_counts, candle_lengthScaledTPM and function fixCounts
+
+## before we go forward, let's match up the batch information
+## match batches data to pathways_id 
+## code from Alison's CRH analysis in CANDLE 
+## CRH_PreliminaryDataPreprocessing_3102023.Rmd
+rownames(batches) <- colnames(candle_counts$counts)
+batches$pathways_id <- colnames(candle_counts$counts)
+
+## let's save annot as annot_mRNA
+annot_mRNA <- annot
+rm(annot)
+
+## miRNA data
+## load the data from both batches
+## ONLY USE BATCH ONE as the source of IDs for sequencing batch
+all_mirs <- readRDS("/Volumes/paquette_a/CANDLE_miRNA/RawData/all_mirs_20240718.Rds")
+
+batch_one_mirs <- readRDS("/Volumes/paquette_a/CANDLE_miRNA/RawData/batch_one_mirs_20240718.Rds")
+```
+
+## Filter covariate by inclusion criteria
+
+```{r}
+## sanity check (make sure all 765 miRNA samples and all 794 mRNA samples match)
+p0047_candle$pathways_id %in% colnames(as.data.frame(all_mirs)) |> sum() 
+p0047_candle$pathways_id %in% colnames(candle_counts$counts) |> sum()
+
+## list IDs
+ids_mRNA <- colnames(candle_counts$counts) |> unique()
+ids_miRNA <- colnames(all_mirs)[-1] |> unique()
+
+## confirm the size of the intersect, 765
+ids_miRNA %in% ids_mRNA |> sum()
+
+## keep ids
+pathways_ids_to_keep <- ids_miRNA[ids_miRNA %in% ids_mRNA]
+
+## generate a miRNA sequencing variable
+miRNA_batches <- tibble::tibble(pathways_id = ids_miRNA) |>
+  dplyr::mutate(mir_batch = dplyr::if_else(pathways_id %in% colnames(batch_one_mirs) == TRUE, 1, 2) |> factor())
+```
+
+## Filter covariate data by exclusion criteria
+
+```{r}
+covar <- p0047_candle |>
+  ## filter to correct IDs
+  dplyr::filter(pathways_id %in% pathways_ids_to_keep) |>
+  ## from 1503 to 765
+  ## remove participants with placental abruption, preeclampsia, or chorioamnionitis or NA values
+  dplyr::filter(m_chorio == "0" & h_placental_abrupt == "0" & m_preeclam == "0") |>
+  ## from 765 to 753
+  ## also other hypertension variables
+  
+  dplyr::filter(m1mb_chtn == "0") |> ## Chronic HTN in current pregnancy at M1 (NA = 5)
+  dplyr::filter(m1mb_chtn2 == "0") |> ## Chronic HTN ever (NA = 5)
+  dplyr::filter(ld_gesthtn4 == "0") |> ## PE or gHTN diagnosed since last visit at delivery (NA = 56)
+  dplyr::filter(ld_cshtn == "0" | is.na(ld_cshtn) == TRUE) |> ## C-section indication: PE/HTN
+  dplyr::filter(ld_mhtn == "0" | is.na(ld_mhtn) == TRUE) |> ## Delivery classifcation: PTB--PE/HTN
+  ## From 753 to 691
+  ## NOTE: we DO NOT remove induced labors here
+  ## add in the miRNA batch; use left join to only match filtered data
+  dplyr::left_join(miRNA_batches, by = join_by(pathways_id)) |>
+  dplyr::left_join(batches |> dplyr::select(pathways_id, mRNA_batch = Analysis),
+                   by = join_by(pathways_id))
+```
+
+Now that we have cleaned our covariate data, we can use the participant IDs for the sequencing data. At this point, only batch data will be used as a covariate. 
+
+## Clean and filter the miRNA data
+
+Here, I am adapting code from Alison's CRH analysis in CANDLE (CRH_PreliminaryDataPreprocessing_3102023.Rmd) and her miRNA cleaning.
+
+```{r}
+Counts <- all_mirs[, covar$pathways_id] |>
+  ## force as matrix
+  scale(center = FALSE, scale = FALSE)
+
+## make an annotation file
+rownames(Counts) <- all_mirs$Name
+
+annot_mir <- data.frame(name = all_mirs$Name, 
+                miRNA = dplyr::if_else(str_detect(all_mirs$Name, "miR"), 1, 0),
+                piRNA = dplyr::if_else(str_detect(all_mirs$Name, "piR"), 1, 0)) |>
+  ## the let miRNAs aren't labled, so let's fix that
+  dplyr::mutate(miRNA = dplyr::if_else(str_detect(all_mirs$Name, "let"), 1, miRNA))
+
+rownames(annot_mir) <- annot_mir$name
+
+## sanity check 
+table(annot_mir$miRNA, annot_mir$piRNA)
+
+print("Original")
+print(dim(Counts)[1])
+print(dim(annot_mir)[1])
+
+## there are some NAs that need to be turned to 1s since cpm cannot handle them
+Counts[is.na(Counts)] <- 0
+
+## Remove piRNA
+annot_mir <- annot_mir |> 
+  dplyr::filter(miRNA == 1)
+Counts <- Counts[annot_mir$name, ]
+
+## ComBat-seq
+
+Counts <- sva::ComBat_seq(counts = Counts, 
+                          batch = factor(covar$mir_batch))
+
+## Get CPM & Log Transform
+cpm <- cpm(Counts, log = TRUE)
+
+## filter based on low expression
+## this is a stringent limit, but seems to provide good quality data
+keep <- rowMeans(cpm) > 0
+summary(keep)
+
+cpm_filt <- cpm[keep, ]
+annot_mir <- annot_mir[keep, ]
+counts_filt <- Counts[keep, ]
+
+print("Filtering")
+print(dim(cpm_filt)[1])
+print(dim(annot_mir)[1])
+print(dim(counts_filt)[1])
+
+plot(density(cpm), main="Before Filtering")
+abline(v = 0, col = "red", lty = 2)
+plot(density(cpm_filt), main="After Filtering")
+abline(v = 0, col = "red", lty = 2)
+
+Y <- DGEList(counts = counts_filt)
+
+boxplot(Y$counts[, 1:10])
+boxplot(cpm[, 1:10])
+boxplot(cpm(Y, log = T)[, 1:10])
+Y <- calcNormFactors(Y, method = "TMM") # This is the Default Method
+boxplot(cpm(Y, log = T)[, 1:10])
+
+### Calculate CPM
+CPM_mir <- cpm(Y, log = T)
+
+rownames(CPM_mir) <- rownames(counts_filt)
+
+miRNA <- Y
+
+rm(batch_one_mirs, all_mirs, Counts, counts_filt, cpm, cpm_filt, p0109_data, Y, 
+   ids_miRNA, ids_mRNA, keep, pathways_ids_to_keep)
+```
+
+Write this data to a file. 
+
+```{r}
+save(miRNA, annot_mir, CPM_mir,
+     file = here::here("network_construction", "intermediateData", "clean_miRNA.RData"))
+```
+
+## Clean and filter the mRNA data
+
+```{r}
+Counts <- candle_counts$counts[, covar$pathways_id]
+LSCounts <- candle_lengthScaledTPM$counts[, covar$pathways_id]
+LSLength <- candle_lengthScaledTPM$counts[, covar$pathways_id]
+
+print("Original")
+print(dim(annot_mRNA)[1])
+print(dim(Counts)[1])
+print(dim(LSCounts)[1])
+print(dim(LSLength)[1])
+
+#get rownames of count dataset to match annot$ENSEMBL by removing the "." and 
+# everything after it
+rownames(Counts) <- gsub("\\..*", "", rownames(Counts))
+rownames(LSCounts) <- gsub("\\..*", "", rownames(LSCounts))
+rownames(LSLength) <- gsub("\\..*", "", rownames(LSLength))
+
+annot_mRNA <- subset(annot_mRNA, BIOTYPE == "protein_coding") |>
+  droplevels()
+Counts <- Counts[as.character(annot_mRNA$ENSEMBL), ]
+LSCounts <- LSCounts[as.character(annot_mRNA$ENSEMBL), ]
+LSLength <- LSLength[as.character(annot_mRNA$ENSEMBL), ]
+
+print(dim(Counts)[1])
+print(dim(LSCounts)[1])
+print(dim(LSLength)[1])
+
+## ComBat
+Counts <- Counts |>
+  ## force as matrix
+  scale(center = FALSE, scale = FALSE)
+
+LSCounts <- LSCounts |>
+  ## force as matrix
+  scale(center = FALSE, scale = FALSE)
+
+Counts <- sva::ComBat_seq(counts = Counts,
+                          batch = factor(covar$mRNA_batch))
+
+LSCounts <- sva::ComBat_seq(counts = LSCounts,
+                          batch = factor(covar$mRNA_batch))
+
+# Get CPM & Log Transform
+cpm <- cpm(LSCounts, log = TRUE)
+
+# filter based on low expression
+keep <- rowMeans(cpm) > 0
+summary(keep)
+
+cpm_filt <- cpm[keep, ]
+counts_filt <- LSCounts[keep, ]
+length_filt <- LSLength[keep, ]
+annot_mRNA <- annot_mRNA[keep, ]
+
+print("Filtering")
+print(dim(cpm_filt)[1])
+print(dim(counts_filt)[1])
+print(dim(length_filt)[1])
+
+plot(density(cpm), main = "Before Filtering")
+abline(v = 0, col = "red", lty = 2)
+plot(density(cpm_filt), main = "After Filtering")
+abline(v = 0, col = "red", lty = 2)
+
+#remove remaining duplicate genes
+summary(duplicated(cpm_filt))
+
+dupgenes <- as.character(annot_mRNA[annot_mRNA$ENSEMBL %in% rownames(cpm_filt)[duplicated(cpm_filt)], "SYMBOL"])
+dupgenes
+
+dupsymbol <- annot_mRNA |>
+  dplyr::filter(duplicated(SYMBOL)) |>
+  dplyr::pull(SYMBOL) |>
+  as.character()
+dupsymbol
+
+annot_mRNA <- annot_mRNA[-which(annot_mRNA$SYMBOL %in% c(dupgenes, dupsymbol)), ] |>
+  droplevels()
+cpm_filt <- cpm_filt[rownames(cpm_filt) %in% annot_mRNA$ENSEMBL, ]
+counts_filt <- counts_filt[rownames(counts_filt) %in% annot_mRNA$ENSEMBL, ]
+length_filt <- length_filt[rownames(length_filt) %in% annot_mRNA$ENSEMBL, ]
+
+table(annot_mRNA$BIOTYPE)
+
+print("Remove Duplicates")
+print(dim(annot_mRNA)[1])
+print(dim(cpm_filt)[1])
+print(dim(counts_filt)[1])
+print(dim(length_filt)[1])
+
+Y <- DGEList(counts = counts_filt, genes = annot_mRNA$SYMBOL)
+
+boxplot(Y$counts[, 1:10])
+boxplot(cpm[, 1:10])
+boxplot(cpm(Y, log = T)[, 1:10])
+Y <- calcNormFactors(Y, method = "TMM") #This is the Default Method
+boxplot(cpm(Y, log = T)[, 1:10])
+
+## CPM
+CPM_mRNA <- cpm(Y, log = TRUE)
+
+### Calculate RPKM
+RPKM <- cpm(Y, log = TRUE) - log2(rowMeans(length_filt)/1000)
+hist(RPKM[, 1], 101)
+Y$RPKM <- RPKM
+
+Y -> RNASeq
+
+rm(Y, candle_counts, candle_lengthScaledTPM, Counts, counts_filt, cpm, cpm_filt, length_filt, LSCounts, LSLength, RPKM, dupgenes, dupsymbol, keep)
+```
+
+Write this data to a file. 
+
+```{r}
+save(RNASeq, annot_mRNA, CPM_mRNA,
+     file = here::here("network_construction", "intermediateData", "clean_RNASeq.RData"))
+```
+
+Now, we have cleaned data, so we can move on to generating the putative list of miRNA--target mRNA interactions.

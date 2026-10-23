@@ -1,0 +1,409 @@
+---
+title: "Cleaning the putative miRNA--mRNA pairs from TargetScan and miRDB"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+### Aim
+
+The goal of this document is to identify the putative miRNA--mRNA target pairs from two databases using computational prediction strategies, miRDB and TargetScan. 
+
+We will start by generating an annotation file that links ENSEMBL IDs (unique IDs for mRNA) to RefSeq accession numbers (gene identifiers for miRDB).
+
+```{r}
+## libraries
+library(tidyverse)    ## for tibbles, pipes, ggplot2
+library(kableExtra)   ## print nice tables to HTML
+library(here)         ## file locations
+library(assertthat)   ## sanity checks
+library(ape)          ## read gff files
+```
+
+Read full annotation file.
+
+```{r}
+annotation <- ape::read.gff(here::here("network_construction/gencode_v33/gencode.v33.annotation.gff3"))
+```
+
+Now, expand out the attributes, which link to the ENSEMBL gene IDs. 
+
+```{r}
+annotation_genes <- annotation |>
+  ## first, we only want genes, but we need transcripts to get transcript IDs
+  dplyr::filter(type == "transcript") |>
+  ## want to get attributes out, so make attributes a list
+  dplyr::mutate(attributes_as_list = base::strsplit(attributes, ";")) |>
+  ## pull the attributes out into individual rows
+  tidyr::unnest_longer(attributes_as_list) |>
+  ## separate the attribute name from the value
+  tidyr::separate_wider_delim(cols = attributes_as_list, delim = "=",
+                       names = c("attribute", "value")) |>
+  ## pivot wider so there is one row per observation
+  tidyr::pivot_wider(
+    id_cols = 1:9, 
+    names_from = attribute, 
+    values_from = value) |>
+  ## filter to only include protein_coding genes 
+  dplyr::filter(transcript_type == "protein_coding") |>
+  ## note: score not used in the original file, phase NA for all values; remove
+  dplyr::select(seqid, source, start, end, strand, 
+                ensembl_transcript_id_version = transcript_id,
+                ensembl_gene_id_version = gene_id,
+                gene_name, hgnc_id) |>
+  dplyr::distinct()
+```
+
+Read in other annotations: RefSeq and HGNC gene symbols.
+
+```{r}
+refseq <- readr::read_tsv(
+  here::here("network_construction/gencode_v33/gencode.v33.metadata.RefSeq"), 
+  col_names = c("ensembl_transcript_id_version", "refseq_mrna", "refseq_protein")) |>
+  dplyr::select(-refseq_protein) |>
+  dplyr::filter(ensembl_transcript_id_version %in% annotation_genes$ensembl_transcript_id_version) |>
+  na.omit() |>
+  dplyr::distinct() |>
+  ## now, we ultimately want to match these to genes, not transcripts
+  dplyr::left_join(
+    annotation_genes |>
+      dplyr::select(ensembl_transcript_id_version, ensembl_gene_id_version)) |>
+  dplyr::select(ensembl_gene_id_version, refseq_mrna) |>
+  dplyr::distinct()
+
+hgnc <- read_tsv(
+  here::here("network_construction/gencode_v33/gencode.v33.metadata.HGNC"), 
+                 col_names = c("ensembl_transcript_id_version", "hgnc_symbol", "hgnc_id")) |>
+  dplyr::filter(ensembl_transcript_id_version %in% annotation_genes$ensembl_transcript_id_version) |>
+  ## now, we ultimately want to match these to genes, not transcripts
+  ## to do this without a ton of NAs, let's do that here
+  dplyr::left_join(annotation_genes |>
+                     dplyr::select(ensembl_gene_id_version, hgnc_id)) |>
+  dplyr::select(ensembl_gene_id_version, hgnc_id, hgnc_symbol) |>
+  dplyr::distinct()
+
+annot <- dplyr::full_join(hgnc, refseq,
+                                 by = join_by("ensembl_gene_id_version")) |>
+  dplyr::distinct() |>
+  ## still need the ensembl ids WITHOUT refseq or hgnc info
+  dplyr::full_join(annotation_genes |>
+                     dplyr::select(ensembl_gene_id_version, gene_name) |>
+                     dplyr::distinct()) |>
+  ## make the stable ENSEMBL ID version and refseq accession
+  dplyr::mutate(ensembl_gene_id = gsub("\\..*", "", ensembl_gene_id_version),
+                refseq_accession = gsub("\\..*", "", refseq_mrna))
+```
+
+Write files.
+
+```{r}
+write_csv(annotation_genes, here::here("network_construction/intermediateData/annotation_gencode_v33_proteincoding.csv"))
+
+write_csv(annot, here::here("network_construction/intermediateData/annotation_proteincoding_refseq.csv"))
+```
+
+Clean up environment.
+
+```{r}
+rm(annotation, refseq, hgnc)
+```
+
+## Approach in Brief
+
+We will use **TargetScan** (version 8, accessed directly from site on 20240404) and **miRDB** (version 6, accessed directly from site on 20240514).
+Originally, we planned to only use TargetScan, but this database is focused on highly evolutionarily conserved miRNA target sites and as a result doesn't fully cover the human-specific miRNAs (e.g., the Chromosome 19 micrRNA cluster).
+Because we will test the associations between miRNA and computationally predicted (putative) mRNA targets to generate the final network, we are most interested in computationally predicted (rather than experimentally validated) targets since relatively little work has been done specifically looking at targets in the placenta.
+
+# TargetScan
+
+First, we will load gene information and miR family information.
+TargetScan provides complete target prediction for the "representative miRNA" within each family.
+Thus, predictions are the same for all members of the family and the family information is needed to fully generate the putative target list.
+
+These data sets are huge and we are only interested in human miRNA, so we will filter our dataframes to only include human miRNA families (taxon ID: 9606).
+
+```{r}
+## load the Gene Info file, downloaded from TargetScan directly
+gene_info <- read_tsv(here::here("network_construction", "TargetScan", "Gene_info.txt")) |>
+  ## rename first three columns to match our conventions
+  dplyr::rename("ensembl_transcript_id_version" = "Transcript ID", 
+                "ensembl_gene_id_version" = "Gene ID", 
+                "hgnc_symbol" = "Gene symbol") |>
+  ## only human genes, don't need to filter
+  ## but do want to generate the stable ensembl ids
+  dplyr::mutate(ensembl_gene_id = gsub("\\..*", "", ensembl_gene_id_version),
+                ensembl_transcript_id = gsub("\\..*", "", ensembl_transcript_id_version))
+
+gene_info |> 
+  dplyr::select(ensembl_gene_id, hgnc_symbol) |>
+  dplyr::distinct() |>
+  dim()
+## 19474 distinct rows
+
+## sanity check
+## do the stable ensembl ids match?
+dplyr::inner_join(gene_info |>
+                    dplyr::select(ensembl_gene_id) |>
+                    distinct(),
+                  annot |> 
+                    dplyr::select(ensembl_gene_id) |>
+                    distinct(),
+                  by = join_by(ensembl_gene_id)) |>
+  dim()
+## 18461 matching ensembl ids out of 19474 in gene_info
+
+miR_family <- read_tsv(here::here("network_construction", "TargetScan", "miR_Family_Info.txt")) |> 
+  dplyr::filter(`Species ID` == 9606)
+## note that "the number indicates that a miRNA family is highly conserved (2), conserved (1), poorly conserved but confidently annotated (0), or poorly conserved and possibly misannotated as a miRNA (-1)" (see FAQ for release 8)
+
+## sanity checks
+miR_family$`MiRBase ID` |> unique() |> length()
+## 2606
+```
+
+#### Now, load the actual target predictions. 
+
+**Ultimately**, we are going to use ANY gene with a predicted target site (regardless of conserved status) and then test these putative targets using our expression data from sequencing. 
+
+I originally selected the Context++ scores for target genes based on the TargetScan FAQ (https://www.targetscan.org/faqs.Release_8.html).
+
+It suggests:
+
+* Using the cummulative measures for a *target* rather than a binding site, because multiple weak binding sites together may have more impact than a single strong binding site.
+* P~CT~ scores the "biological function" (related to "evolutionary conservation"), while context scores score the "biochemical response to the miRNA" (related to "targeting efficacy")
+
+Additionally, the page on [context++ scores] (https://www.targetscan.org/mmu_80/docs/context_score.html) indicates that "[a]lthough only one miRNA is chosen as the representative miRNA, all the other miRNAs of the miRNA family are also predicted to target the same target gene at the same target site(s)."
+
+Thus, for my purposes, I can use the "summary counts, all predictions" data set, which includes "every Gene:miRNAfamily pair, including total context++ scores, weighted context++ scores, aggregate PCTs, and predicted occupancies." 
+We only need a small subset of these data for our purposes. 
+We should be able to use the family ID to link the targets to all members of the family. 
+
+This is a very large data set, so we want to reduce their size as much as we can, by filtering to only include human genes, only genes with mRNA expression we measured in the placenta, and only miRNA with expression we measured in the placenta in our cohort. 
+
+First, load the cleaned sequencing data. 
+
+```{r}
+load(file = here::here("network_construction", "intermediateData", "clean_RNASeq.RData"))
+## only want to keep annotation file!
+rm(CPM_mRNA, RNASeq)
+
+load(file = here::here("network_construction", "intermediateData", "clean_miRNA.RData"))
+## only want to keep annotation file!
+rm(CPM_mir, miRNA)
+
+placental_mir_family_list <- miR_family |>
+  dplyr::filter(`MiRBase ID` %in% annot_mir$name) |>
+  dplyr::pull(`Seed+m8`) |>
+  unique()
+```
+
+Now, load the TargetScan data that we have previously downloaded.
+
+```{r}
+pred_targ <- read_tsv(here::here("network_construction", "TargetScan", "Summary_Counts.all_predictions.txt")) |> 
+  ## very large, need to filter by species ID (NCBI Taxa)
+  dplyr::filter(`Species ID` == 9606) 
+
+## mir FAMILY list
+## this is complicated because the miR_family data set lists family names
+## the pred_targ sequence (below) lists a 7 base sequence, but includes 
+## representative miRNA, the miR family data set has a 7 base sequence called
+## Seed+m8, so we are going to figure out if these line up
+list_of_miR_families <- miR_family |>
+  ## from full data set, only include the so-called representative miRNAs
+  dplyr::filter(`MiRBase ID` %in% pred_targ$`Representative miRNA`) |>
+  ## only select the miRNA ids and their "seeds"
+  dplyr::select(`MiRBase ID`, `Seed+m8`) |>
+  ## remove duplicates (i.e., rows for non-respresentative miRNAs in a family)
+  dplyr::distinct() |>
+  ## arrange by mirBase ID 
+  dplyr::arrange(`MiRBase ID`)
+
+## Sanity checking:
+## now, try joining this information from miR_family to pred_targ
+families_from_pred_targ <- dplyr::full_join(
+  list_of_miR_families, 
+  pred_targ |> 
+    ## rename to match
+    dplyr::select(
+      "MiRBase ID" = `Representative miRNA`,
+      "Seed+m8" = `miRNA family`),
+  by = join_by(`MiRBase ID`, `Seed+m8`)) |> 
+  distinct() |>
+  ## arrange by mirBase ID so it will hopefully match with list_of_miR_families
+  dplyr::arrange(`MiRBase ID`) 
+
+## note the dimensions are the same; promising
+dim(list_of_miR_families)
+dim(families_from_pred_targ)
+
+## confirm they are equal
+assertthat::are_equal(list_of_miR_families, families_from_pred_targ)
+
+## get the unique families (Seed+m8)
+miR_family_list <- list_of_miR_families |> 
+  dplyr::pull(`Seed+m8`) |>
+  unique()
+
+pred_targ_filt <-  pred_targ |>
+  ## stable transcript ID
+  dplyr::rename("ensembl_transcript_id_version" = "Transcript ID") |>
+  dplyr::mutate(
+    ensembl_transcript_id = gsub("\\..*", "", ensembl_transcript_id_version)) |>
+  ## join with the gene information from TargetScan
+  dplyr::full_join(
+    gene_info |>
+      dplyr::select(ensembl_transcript_id_version, ensembl_gene_id),
+    by = join_by(ensembl_transcript_id_version)) |>
+  ## filter to only include target genes in placenta data
+  dplyr::filter(ensembl_gene_id %in% annot_mRNA$ENSEMBL) |>
+  ## filter to only include miRNA in placenta data
+  dplyr::filter(`miRNA family` %in% placental_mir_family_list) |>
+  ## from 7,765,065 rows to 1,190,938
+  dplyr::select(
+    ensembl_transcript_id_version, ensembl_gene_id, `miRNA family`, 
+    `Representative miRNA`, `Total num conserved sites`, 
+    `Total num nonconserved sites`, `Total context++ score`, 
+    `Cumulative weighted context++ score`) |>
+  dplyr::mutate(
+    `Total context++ score` = as.numeric(`Total context++ score`),
+    `Cumulative weighted context++ score` = as.numeric(`Cumulative weighted context++ score`))
+
+summary(pred_targ_filt$`Total context++ score`)
+summary(pred_targ_filt$`Cumulative weighted context++ score`)
+
+dim(pred_targ_filt)
+
+pred_targ_filt <- pred_targ_filt |>
+  dplyr::filter(`Total num conserved sites` + `Total num nonconserved sites` > 0)
+
+dim(pred_targ_filt)
+
+## NOW, we have a "slimmed down" version of the potential edges (only
+## representative miRNA are included currently)
+## Let's make a dataset that has ALL the miRNAs identified in the placentas
+## and their family code
+miRNA_family_key <- miR_family |>
+  dplyr::select(`MiRBase ID`, "miRNA family" = `Seed+m8`) |>
+  dplyr::filter(`MiRBase ID` %in% annot_mir$name == TRUE) |>
+  dplyr::distinct()
+
+dplyr::full_join(miRNA_family_key, pred_targ_filt, by = join_by(`miRNA family`)) |> dim()
+```
+
+Note that there are ~3800 genes missing context++ scores, and these have poorly or non-conserved binding sites.
+Since we will test for correlation between the miRNA and the putative mRNA target, we will retain these. 
+
+Save this pared down version.
+
+```{r}
+predicted_targets_targetscan <- pred_targ_filt
+
+save(predicted_targets_targetscan, miRNA_family_key, file = here::here("network_construction", "intermediateData", "predicted_targets_TargetScan.RData"))
+```
+
+Now, let's clean up the environment before loading the miRDB data. 
+
+```{r}
+rm(list_of_miR_families, families_from_pred_targ, gene_info, miR_family, pred_targ, pred_targ_filt, miR_family_list, predicted_targets_targetscan, miRNA_family_key, placental_mir_family_list)
+```
+
+# miRDB
+
+Load in the miRDB version 6 complete database (accessed 20245013) and use the annotation file loaded in above. This database includes many species, so we want to make sure that we have filtered to only include humans, then only those miRNA measured in our placental samples. 
+
+```{r}
+## load full data and provide colnames
+mirdb <- readr::read_tsv(
+  here::here("network_construction", "miRDB", "miRDB_v6.0_prediction_result.txt"), 
+  ## colnames need to be provided
+  col_names = c("miRNA", "refseq_accession", "target_score"))|>
+  ## now,filter to ***only*** humans, hsa at beginning of string
+  dplyr::filter(stringr::str_detect(miRNA, pattern = "^hsa"))
+
+mirdb_filtered <- mirdb |>
+  dplyr::filter(miRNA %in% annot_mir$name)
+```
+
+Now, match miRDB to filtered annotation file. 
+
+```{r}
+mirdb_annotated <- dplyr::full_join(annot, mirdb_filtered, 
+                                     by = join_by("refseq_accession")) |>
+  dplyr::filter(is.na(miRNA) == FALSE & is.na(ensembl_gene_id) == FALSE) |>
+  dplyr::select(miRNA, ensembl_gene_id, hgnc_symbol, target_score) |>
+  dplyr::distinct()
+
+predicted_targets_miRDB <- mirdb_annotated |>
+  dplyr::select(miRNA, ensembl_gene_id, hgnc_symbol) |>
+  dplyr::distinct() |>
+  dplyr::mutate(miRNA_mRNA_pair = paste(miRNA, ensembl_gene_id, sep = " "))
+```
+
+#### Write results form miRDB
+
+```{r}
+save(mirdb_annotated, predicted_targets_miRDB, file = here::here("network_construction", "intermediateData", "predicted_targets_miRDB.RData"))
+```
+
+Clean up the environment. 
+
+```{r}
+rm(mirdb, mirdb_annotated, mirdb_filtered, predicted_targets_miRDB)
+```
+
+
+# Join TargetScan and miRDB results
+
+We are going to build the putative list of miRNA-mRNA target pairs now. 
+
+```{r}
+load(file = here::here("network_construction", "intermediateData", "predicted_targets_miRDB.RData"))
+load(file = here::here("network_construction", "intermediateData", "predicted_targets_TargetScan.RData"))
+```
+
+Now, build the files out
+
+```{r}
+target_scan <- dplyr::full_join(
+  miRNA_family_key, 
+  predicted_targets_targetscan,
+  by = join_by(`miRNA family`),
+  relationship = "many-to-many") |>
+  ## make a unique id for the correlations to use
+  dplyr::mutate(
+    miRNA_mRNA_pair = paste(`MiRBase ID`, ensembl_gene_id, sep = " ")) |>
+  ## limit to only the miRNA and mRNA we have data on
+  dplyr::filter(ensembl_gene_id %in% annot_mRNA$ENSEMBL) |>
+  dplyr::filter(`MiRBase ID` %in% annot_mir$name) |>
+  dplyr::distinct()
+
+union_of_targets <- dplyr::full_join(
+  ## TargetScan
+  target_scan |>
+    dplyr::select(
+      miRNA = `MiRBase ID`, 
+      ensembl_gene_id, 
+      miRNA_mRNA_pair) |>
+    dplyr::mutate(source = "TargetScan"),
+  ## miRDB
+  predicted_targets_miRDB |>
+    dplyr::select(miRNA, ensembl_gene_id, miRNA_mRNA_pair) |>
+    dplyr::mutate(source = "miRDB"),
+  by = join_by(miRNA, ensembl_gene_id, miRNA_mRNA_pair, source)) |>
+  dplyr::distinct()
+
+simplified_targets <- union_of_targets |>
+  dplyr::select(-source) |>
+  dplyr::distinct()
+```
+
+## Complete putative list of miRNA-mRNA pairs
+
+Write results.
+
+```{r}
+save(union_of_targets,
+     simplified_targets, 
+     file = here::here("network_construction", "intermediateData", "predicted_targets_complete.RData"))
+```

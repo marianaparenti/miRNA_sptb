@@ -1,0 +1,503 @@
+---
+title: "Network Analysis: Network Interpretation and MicroRNA Over-Representation Analysis"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+## Objective
+
+To interpret the microRNA regulatory modules by identifying enrichment for:
+
++ KEGG Pathways (excluding human disease and drug development pathways)
++ Placental transcription factor targets (using the Placental TRN)
++ Enrichment for our previously published transcriptomic signature of spontaneous preterm birth.
+
+### Load libraries and cleaned data
+
+```{r}
+## libraries
+library(tidyverse)    ## for tibbles, pipes, ggplot2
+library(RColorBrewer) ## for color palettes (volcano plots)
+library(edgeR)        ## for over-representation with kegga
+library(kableExtra)   ## print nice tables to HTML
+library(ggrepel)      ## for repelling labels in volcano plots
+library(ggtext)       ## for nicely formatted ggplot axis labels
+library(igraph)       ## in case we need to do network analysis in R
+library(broom)        ## for tidy correlation test results
+library(ape)          ## read gff files
+```
+
+Read in the list of targets. This is analagous to our edge list for the full miRNA--mRNA network. 
+
+```{r}
+## read data
+## mRNA targets of miRNA:
+## first, we found all predicted using TargetScan
+## then, pruned based on negative spearman correlations
+targets <- read_csv(here::here("network_construction", "allPairs_edges_20240719.csv"))
+
+## read gene annotation file
+annotation <- read_csv(here::here("network_construction", "intermediateData", "annotation_gencode_v33_proteincoding.csv")) |>
+    dplyr::mutate(ensembl_gene_id = gsub("\\..*", "", ensembl_gene_id_version))
+```
+
+We also need to consider our background for our enrichment tests.
+We will need to use the full list of mRNA targets used in our miRNA--mRNA correlation analysis. 
+
+```{r}
+## read data
+## mRNA expression
+load(file = here::here("network_generation", "intermediateData", "clean_RNAseq.Rdata"))
+
+## miRNA expression
+load(file = here::here("network_construction", "intermediateData", "clean_miRNA.Rdata"))
+```
+
+## Are microRNA from coding or non-coding regions of the geneome?
+
+First, we want to start by looking at where the miRNA are coming from.
+
+```{r}
+coordinates <- ape::read.gff(here::here("network_construction", "mirbase", "hsa.gff3"))
+
+## read miRNA locations
+all_coordinates <- coordinates |>
+  ## want to get attributes out, so make attributes a list
+  dplyr::mutate(attributes_as_list = base::strsplit(attributes, ";")) |>
+  ## pull the attributes out into individual rows
+  tidyr::unnest_longer(attributes_as_list) |>
+  ## separate the attribute name from the value
+  tidyr::separate_wider_delim(cols = attributes_as_list, delim = "=",
+                       names = c("attribute", "value")) |>
+  ## pivot wider so there is one row per observation
+  tidyr::pivot_wider(id_cols = 1:9, names_from = attribute, values_from = value) |>
+  dplyr::filter(Name %in% annot_mir$name)
+
+microRNA_in_genes <- lapply(unique(all_coordinates$ID), function(x) {
+  ## get chromosome locations
+  mir_chromosome <- all_coordinates |>
+    dplyr::filter(ID == x) |> 
+    dplyr::pull(seqid) |>
+    as.character()
+  
+  mir_strand <- all_coordinates |>
+    dplyr::filter(ID == x) |>
+    dplyr::pull(strand) |>
+    as.character()
+  
+  mir_start <- all_coordinates |>
+    dplyr::filter(ID == x) |> 
+    dplyr::pull(start) |>
+    as.numeric()
+  
+  mir_end <- all_coordinates |> 
+    dplyr::filter(ID == x) |>
+    dplyr::pull(end) |>
+    as.numeric()
+  
+  mir_name <- all_coordinates |> 
+    dplyr::filter(ID == x) |> 
+    dplyr::pull(Name) 
+  
+  ## get overlapping genes
+  overlap_genes <- annotation |>
+    dplyr::filter(seqid == mir_chromosome & strand == mir_strand) |>
+    dplyr::filter(start <= mir_start) |>
+    dplyr::filter(end >= mir_end) |>
+    dplyr::mutate(ensembl_gene_id = gsub("\\..*", "", ensembl_gene_id_version)) |>
+    dplyr::select(ensembl_gene_id, ensembl_gene_id_version) |>
+    dplyr::mutate(miRNA = mir_name,
+                  ID = x)
+
+  overlap_genes
+}) |>
+  dplyr::bind_rows() |>
+  dplyr::inner_join(annotation) |>
+  dplyr::select(ensembl_gene_id, gene_name, miRNA) |>
+  dplyr::distinct()
+
+## how many miRNA are overlapping genes?
+microRNA_in_genes$miRNA |> unique() |> length()
+## 239 out of 563 miRNA
+
+## how many of these are located in the locus of one (or more) of their targets?
+microRNA_in_genes |>
+  dplyr::filter(paste(miRNA, ensembl_gene_id, sep = " ") %in% targets$miRNA_mRNA_pair) |>
+  dplyr::select(miRNA, ensembl_gene_id, gene_name) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+Only 3 microRNA are targeting their host genes in this network.
+
+## Enrichment: Over Representation Analysis (ORA)
+
+First, we will consider total regulon size. 
+
+```{r}
+## summarize
+regulon_counts <- targets |>
+  dplyr::group_by(miRNA) |>
+  dplyr::select(miRNA) |>
+  dplyr::count() |>
+  dplyr::rename(target_counts = n)
+
+hist(regulon_counts$target_counts, breaks = 50)
+
+regulon_counts |>
+  dplyr::arrange(desc(target_counts)) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+#### Consider the placental specific microRNA clusters
+
+Make the list of C14MC, C19MC, and mir-371 family clusters. 
+
+```{r}
+## load complete mirbase coordinates that we can use to generate our list of
+## miRNA clusters
+coordinates <- ape::read.gff(here::here("network_construction", "mirbase", "hsa.gff3"))
+
+locusC14MC <- coordinates |>
+  ## filter to correct locus, the DLK1-DIO3 region
+  ## DIO3 start of transcription: 101,561,497
+  ## MEG8 start of transcriptoin: 100,779,410
+  dplyr::filter(seqid == "chr14" & start >= 100726892 & end <= 101563452) |>
+  # dplyr::filter(seqid == "chr14" & start >= 100779410 & end <= 101561497) |>
+  ## want to get attributes out, so make attributes a list
+  dplyr::mutate(attributes_as_list = base::strsplit(attributes, ";")) |>
+  ## pull the attributes out into individual rows
+  tidyr::unnest_longer(attributes_as_list) |>
+  ## separate the attribute name from the value
+  tidyr::separate_wider_delim(cols = attributes_as_list, delim = "=",
+                       names = c("attribute", "value")) |>
+  ## pivot wider so there is one row per observation
+  tidyr::pivot_wider(id_cols = 1:9, names_from = attribute, values_from = value) |>
+  ## remove null columns
+  dplyr::select(-c(source, score, phase, attributes)) |>
+  dplyr::mutate(cluster = "C14MC")
+
+locusC19MC <- coordinates |>
+  ## locus defined in kobayashi2022 (includes Bortolin-Cavaille and Cavaille as senior authors)
+  dplyr::filter(seqid == "chr19" & start >= 53641328 & end <= 53769467) |>
+  ## want to get attributes out, so make attributes a list
+  dplyr::mutate(attributes_as_list = base::strsplit(attributes, ";")) |>
+  ## pull the attributes out into individual rows
+  tidyr::unnest_longer(attributes_as_list) |>
+  ## separate the attribute name from the value
+  tidyr::separate_wider_delim(cols = attributes_as_list, delim = "=",
+                       names = c("attribute", "value")) |>
+  ## pivot wider so there is one row per observation
+  tidyr::pivot_wider(id_cols = 1:9, names_from = attribute, values_from = value) |>
+  ## remove null columns
+  dplyr::select(-c(source, score, phase, attributes)) |>
+  dplyr::mutate(cluster = "C19MC")
+
+locusMir371Family <- coordinates |>
+  ## locus identified in UCSC Genome Browser
+  dplyr::filter(seqid == "chr19" & start >= 53786900 & end <= 53789200) |>
+  ## want to get attributes out, so make attributes a list
+  dplyr::mutate(attributes_as_list = base::strsplit(attributes, ";")) |>
+  ## pull the attributes out into individual rows
+  tidyr::unnest_longer(attributes_as_list) |>
+  ## separate the attribute name from the value
+  tidyr::separate_wider_delim(cols = attributes_as_list, delim = "=",
+                       names = c("attribute", "value")) |>
+  ## pivot wider so there is one row per observation
+  tidyr::pivot_wider(id_cols = 1:9, names_from = attribute, values_from = value) |>
+  ## remove null columns
+  dplyr::select(-c(source, score, phase, attributes)) |>
+  dplyr::mutate(cluster = "Mir371_family")
+
+mirClusterKey <- dplyr::bind_rows(locusC14MC, locusC19MC, locusMir371Family) |>
+  dplyr::mutate(cluster = factor(cluster))
+
+rm(locusC14MC, locusC19MC, locusMir371Family)
+
+write_csv(mirClusterKey |>
+            dplyr::select(Name, cluster) |>
+            dplyr::distinct(), 
+          file = here::here("network_construction", "interpretation", "placenta_specific_miRNA_clusters_updated.csv"))
+
+cluster_coordinates <- ape::read.gff(here::here("network_construction", "mirBase", "hsa.gff3")) |>
+  ## want to get attributes out, so make attributes a list
+  dplyr::mutate(attributes_as_list = base::strsplit(attributes, ";")) |>
+  ## pull the attributes out into individual rows
+  tidyr::unnest_longer(attributes_as_list) |>
+  ## separate the attribute name from the value
+  tidyr::separate_wider_delim(cols = attributes_as_list, delim = "=",
+                              names = c("attribute", "value")) |>
+  ## pivot wider so there is one row per observation
+  tidyr::pivot_wider(id_cols = 1:9, names_from = attribute, values_from = value) |>
+  ## remove null columns
+  dplyr::select(-c(source, score, phase, attributes)) |>
+  ## add annotations for clusters
+  dplyr::mutate(C19MC = dplyr::if_else(seqid == "chr19" & start >= 53641328 & end <= 53769467, 
+                                       1, 0) |> factor(),
+                ## locus defined in kobayashi2022 (includes Bortolin-Cavaille and Cavaille as senior authors)
+                C14MC = dplyr::if_else(seqid == "chr14" & start >= 100726892 & end <= 101563452, 
+                                       1, 0) |> factor(),
+                miR371family = dplyr::if_else(seqid == "chr19" & start >= 53786900 & end <= 53789200, 
+                                        1, 0) |> factor()) |>
+  dplyr::filter(C19MC == "1" | C14MC == "1" | miR371family == "1") |>
+  dplyr::filter(type != "miRNA_primary_transcript") |>
+  dplyr::mutate(cluster = dplyr::case_when(C19MC == "1" ~ "C19MC",
+                                           C14MC == "1" ~ "C14MC",
+                                           miR371family == "1" ~ "miR-371 family") |> 
+                  factor(),
+                in_network = dplyr::if_else(Name %in% unique(targets$miRNA) == TRUE, 
+                                            1, 0) |> factor(labels = c("No", "Yes")))|>
+  dplyr::select(Name, chromosome = seqid, start, end, strand, cluster, in_network)
+
+write_csv(cluster_coordinates |>dplyr::distinct(), 
+          file = here::here("network_construction", "interpretation", "placenta_specific_miRNA_clusters_for_manuscript.csv"))
+```
+
+## Interpretation: Pathway ORA
+
+Now, let's interpret the modules, starting with KEGG pathway ORA.
+
+First, load KEGG Database
+
+```{r}
+load(here::here("network_construction", "KEGG_pathways", "KEGG_database_20240719.Rds"))
+```
+
+Second, get NCBI (Entrez) gene IDs using our annotation file.
+
+```{r}
+entrez <- read_tsv(here::here("network_construction", "genecode_v33", "gencode.v33.metadata.EntrezGene"), 
+                   col_names = c("ensembl_transcript_id_version", "ncbi_gene_id"))
+
+annot_entrez <- dplyr::inner_join(
+  annotation |>
+    dplyr::mutate(
+      ensembl_gene_id = gsub("\\..*", "", ensembl_gene_id_version)) |>
+    dplyr::filter(ensembl_gene_id %in% targets$mRNA_target), 
+  entrez |>
+    dplyr::select(ensembl_transcript_id_version, ncbi_gene_id) |>
+    na.omit() |>
+    dplyr::distinct(),
+  by = join_by(ensembl_transcript_id_version)) |>
+  dplyr::select(ensembl_gene_id, ncbi_gene_id, gene_name) |>
+  dplyr::distinct()
+```
+
+Now, let's conduct the ORA. 
+We are going to limit this to miRNA with regulons with at least 10 targets. 
+
+```{r}
+limited_pathways <- keggs |>
+  dplyr::filter(PathwayID %in% keggmapper$V1) 
+
+miRNA_ORA_pathways <- lapply(regulon_counts[regulon_counts$target_counts>=10, ]$miRNA, function(candidate) {
+  ## setup
+  moduleGenes <- unique(dplyr::filter(targets, miRNA == candidate)$mRNA_target) 
+  
+  ## select module genes as moduleGeneSet
+  moduleGeneSet <- annot_entrez |>
+    dplyr::filter(ensembl_gene_id %in% moduleGenes)
+  
+  ## test if the module geneset 
+  mod_enriched <- limma::kegga(moduleGeneSet$ncbi_gene_id, 
+                               species = "Hs",
+                               universe = annot_entrez$ncbi_gene_id,
+                               gene.pathway = limited_pathways,
+                               pathway.names = keggmapper,
+                               FDR = 0.05,
+                               restrict.universe = TRUE)
+  
+  mod_enriched$FDR <- p.adjust(mod_enriched$P.DE, method = "BH")
+  
+  mod_enriched |>
+    dplyr::arrange(P.DE) |>
+    dplyr::mutate(miRNA = candidate) |>
+    dplyr::relocate(miRNA)
+
+}) |>
+  dplyr::bind_rows() 
+
+miRNA_ORA_pathways |>
+  dplyr::as_tibble() |>
+  dplyr::filter(FDR < 0.05) |>
+  dplyr::arrange(miRNA) |>
+  kable() |>
+  kableExtra::kable_styling() |>
+  kableExtra::collapse_rows(1, target = 1)
+```
+
+Write the enriched pathways to a file
+
+```{r}
+write_csv(dplyr::as_tibble(miRNA_ORA_pathways), file = here::here("network_construction", "interpretation", "complete_pathway_enrichment_results.csv"))
+```
+
+## Interpretation: Transcription Factor ORA
+
+We can also look at transcription factors from the TRN that are enriched for each of these pathways.
+Code below is adapted from Alison's TRN analysis.
+
+```{r}
+EnrichFisher<-function(NSigGenes, NTotalGenes, SigInGroup, GroupSize){
+
+  a = SigInGroup ## Equivalent to X; Table 3. In the TFgroup and DE
+  b = GroupSize-SigInGroup # Equivalent to m-X: In the TFGroup but NOT DE
+  c = NSigGenes-SigInGroup  # Equivalent to K-X; DE but not in the group
+  n = NTotalGenes-GroupSize # n in contigencyTable: not in group
+  d = n - c
+  mat<-(matrix(c(a, c, b, d), nrow=2))
+  mat
+  sum(mat)==NTotalGenes
+  fisher.test(mat,alternative="greater")$p.value #default is 2 sided. We need this to be greater rather than less to say that these genes are enriched
+}
+```
+
+Load Placental TRN
+
+```{r}
+TRNModel <-  read.csv("/Volumes/paquette_a/mparenti/resources/Placental_Gene_TF_Associations.csv")
+TRNModel <- TRNModel[,-1]
+TRNModel$targetGene <- as.character(TRNModel$targetGene)
+TRNModel$TF <- as.character(TRNModel$TF)
+```
+
+Conduct enrichment analysis.
+
+```{r}
+miRNA_enrichedTFs <- lapply(regulon_counts[regulon_counts$target_counts>=10, ]$miRNA, function(module) {
+  
+  ## setup
+  ## pull the genes that are targeted by any miRNA
+  ensembl_ids <- targets |>
+    dplyr::filter(miRNA == module) |>
+    dplyr::pull(mRNA_target) |>
+    unique()
+  
+  moduleGenes <- annot_entrez |>
+    dplyr::filter(ensembl_gene_id %in% ensembl_ids) |>
+    dplyr::pull(gene_name) |>
+    unique()
+ 
+  ## code from Alison's TRN  
+  TFTable <- as.data.frame(table(TRNModel$TF))
+  colnames(TFTable)<-c("TF","NTargets")
+  rownames(TFTable)<-TFTable$TF
+
+  TFTable$TF<-as.character(TFTable$TF)
+  TFTable$SigGenes<-NA
+
+  for(i in 1:dim(TFTable)[1]) {
+    x<-subset(TRNModel, TF==as.character(TFTable$TF[i])) # Pull out the TF of interest
+    dim(x)[1]==TFTable$NTargets[i] #This should be equal
+    TFTable$SigGenes[i]<-length(intersect(as.character(x$targetGene), moduleGenes)) #How many in the input gene list match this TF?
+  }
+
+  TFTable$FisherTest<-NA
+  # Perform Enrichment Test using Fishers Exact Function
+  for(i in 1:length(TFTable$TF)){
+    TFTable$FisherTest[i]<-EnrichFisher(NSigGenes=as.numeric(length(moduleGenes)),NTotalGenes=7712,SigInGroup =TFTable$SigGenes[i],GroupSize=TFTable$NTargets[i])
+  }
+
+  AllTFTable<-TFTable
+  # Filter By Preset Thresholds
+  
+  MinSigGenes=5
+  
+  TFTable<-subset(TFTable, moduleGenes>=MinSigGenes)
+  TFTable$FisherAdjustP<-p.adjust(TFTable$FisherTest,method="BH",n=dim(TFTable)[1])
+
+  EnrichedTFTable <- subset(TFTable,FisherAdjustP<0.05) |>
+    dplyr::as_tibble() |>
+    dplyr::mutate(miRNA = module) 
+  
+  EnrichedTFTable
+}) |>
+  dplyr::bind_rows() |> 
+  relocate(miRNA)
+```
+
+The full list of enriched TFs includes 9,558 rows (and takes several minutes to run given the number of TFs and miRNAs). 
+
+We will write the full results to a CSV and inspect the results below. 
+
+```{r}
+write_csv(miRNA_enrichedTFs, file = here::here("network_construction", "interpretation", "sig_enriched_transcription_factors.csv"))
+```
+
+Let's look at miRNA and their mRNA targets that are transcription factors. Let's focus on only transcription factors that are targeted by a microRNA AND whose targets are over-represented in that microRNA's regulon.
+
+## ORA for sPTB-signature enrichement
+
+We first need our list of significant mRNA related to sPTB. 
+For now, let's focus on just the preterm birth vs term birth comparisons. 
+
+```{r}
+## DEGs from sPTB paper
+apaquette2023_sPTB_DEG <- readxl::read_excel("/Volumes/paquette_a/mparenti/nutrientCofactors/apaquette2023_sPTB_DEG.xlsx",
+                                             skip = 1)
+
+colnames(apaquette2023_sPTB_DEG) <- c("gene_name", "logFC_ptb", "FDR_ptb", "logFC_eptb", "FDR_eptb", "logFC_lptb", "FDR_lptb", "priorLit_pereyra2019", "priorLit_brockway2019", "priorLit_paquette2018")
+
+## primarily, interested in the DEGs for preterm vs term births
+ptb_mRNAs <- apaquette2023_sPTB_DEG |> dplyr::filter(is.na(logFC_ptb) == FALSE) |> 
+  dplyr::select(gene_name, logFC = logFC_ptb, FDR = FDR_ptb) |>
+  dplyr::inner_join(annotation |> 
+                      dplyr::select(gene_name, hgnc_id, ensembl_gene_id) |>
+                      dplyr::distinct()) 
+## 938 protein coding DEGs
+
+DEGs <- ptb_mRNAs |>
+  dplyr::filter(ensembl_gene_id %in% targets$mRNA_target) |>
+  dplyr::pull(ensembl_gene_id) |>
+  unique()
+
+rm(apaquette2023_sPTB_DEG)
+```
+
+Now, test if any regulons are enriched for sPTB-associated DEGs. 
+
+```{r}
+miRNA_sptb_enrichment_table <- lapply(regulon_counts$miRNA, function(y) {
+  
+  ## build the contingency table
+  ## number of mRNA genes identified as sPTB DEGS, total
+  a <- length(DEGs) ## 868 DEGs in this mRNA gene background
+  ## total number of genes in the network, as background
+  b <- targets$mRNA_target |> unique() |> length() ## 11771 total genes in network
+  ## note not all DEGs are present in network
+  ## number of the total DEGs (i.e., 920 in this analysis) 
+  ## that are targets of a given miRNA
+  c <- DEGs %in% unique(dplyr::filter(targets, miRNA == y)$mRNA_target) |> sum() 
+  ## total size of the given miRNA's regulon
+  d <- regulon_counts |> dplyr::filter(miRNA == y) |> dplyr::pull(target_counts)
+  
+  ## using the 4 numbers above, we can build the matrix
+  contingency_table <- matrix(c(c, d-c, a-c, b-d-(a-c)), nrow = 2, ncol = 2)
+  
+  ## conduct the test
+  rstatix::fisher_test(xtab = contingency_table, alternative = "greater") |>
+    dplyr::mutate(miRNA = y, 
+                  nDEG = c)
+}) |>
+  dplyr::bind_rows() |>
+  dplyr::full_join(regulon_counts, by = join_by(miRNA)) |>
+  # dplyr::filter(miRNA %in% miR_list) |>
+  dplyr::mutate(p.adj = p.adjust(p, method = "BH")) |>
+  dplyr::select(miRNA, miRNA_target_DEG = nDEG, total_regulon_size = target_counts, p, p.adj) |>
+  dplyr::arrange(miRNA) 
+
+miRNA_sptb_enrichment_table |>
+  dplyr::filter(p.adj < 0.05) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+Write significant results to CSV.
+
+```{r}
+write_csv(miRNA_sptb_enrichment_table |> dplyr::filter(p.adj < 0.05), 
+          file = here::here("network_construction", "interpretation", "miRNA_sPTB_enrichement.csv"))
+```
+
