@@ -36,4 +36,4 @@ The complete differential microRNA expression analysis was conducted in the `DEG
 Human participant data from the Conditions Affecting Neurocognitive Development and Learning in Early childhood (CANDLE) cohort are accessible through the following pathways: 
 
 + **CANDLE sequencing data.** Placental microRNA and mRNA-sequencing data are available in the database of Genotypes and Phenotypes (dbGAP; accession number: phs003619.v1.p1). 
-+ **CANDLE dietary and covariate data.** Covariate and birth outcomes data are maintained by the CANDLE study team and CANDLE has specific policies and procedures for accessing covariate data, which are outlined in the ECHO cohort profile paper (PMCID: PMC9594508). 
++ **CANDLE covariate data.** Covariate and birth outcomes data are maintained by the CANDLE study team and CANDLE has specific policies and procedures for accessing covariate data, which are outlined in the ECHO cohort profile paper (PMCID: PMC9594508). 
